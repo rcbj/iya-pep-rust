@@ -1,0 +1,20 @@
+[package]
+name = "iya-pep"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["rcbjBlueMars <9321971+rcbjBlueMars@users.noreply.github.com>"]
+description = "The iya-sts remote PEP, embedded in an application: a lightweight XACML engine, the control plane and the AuthZEN client"
+repository = "https://github.com/rcbj/iya-pep-rust"
+homepage = "https://github.com/rcbj/iya-pep-rust"
+readme = "README.md"
+keywords = ["xacml", "pep", "authzen", "authorization"]
+categories = ["authentication"]
+
+[dependencies]
+
+[features]
+default = []
+# The local PDP: the XACML engine and the policy pull. Without it, only
+# `central` mode (AuthZEN at the service) is compiled.
+local = []
