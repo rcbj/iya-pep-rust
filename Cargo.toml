@@ -24,7 +24,7 @@ url = "2"
 # The engine's, under `local`.
 regex = { version = "1", optional = true, default-features = false, features = ["std", "unicode"] }
 roxmltree = { version = "0.20", optional = true }
-tokio = { version = "1", features = ["rt", "time", "sync"], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
 
 [features]
 default = []

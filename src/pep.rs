@@ -1,0 +1,585 @@
+// SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
+// SPDX-License-Identifier: MIT
+
+//! The PEP: its lifecycle, the control plane, and `decide`.
+//!
+//! - **`Pep::new`** reads the configuration and the key. Nothing is sent.
+//! - **`start`** runs the background work on a thread of its own:
+//!   - register (`kind: embedded`, the application, the mode and the
+//!     protocol version, iya-sts#2026), again until the service accepts it
+//!     and whenever a heartbeat says the PEP is unknown
+//!   - `local`: the pull, at `fallbackPollMs` with a signal stream or
+//!     `pollIntervalMs` without, at once when an event arrives, and when a
+//!     heartbeat says the PEP is not current
+//!   - the heartbeat, every `heartbeatIntervalMs`
+//!   - the decision records, every few seconds while any are queued
+//!   - the key file, read again when it changes
+//! - **`decide`** never fails: a decision it can't make is `Unavailable`.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::config::{Mode, PepConfig};
+use crate::credential::{Audience, Credential};
+use crate::decision::{evaluation_body, obligation_from, Access, Decision, Subject};
+use crate::error::PepError;
+use crate::http::{Body, Client};
+use crate::key::random_id;
+use crate::records::Records;
+
+/// The PEP protocol version this crate speaks, sent on registration and
+/// heartbeat so the service can refuse one it no longer supports.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The Shared Signals event type that says the bound application's
+/// policies or the catalogue changed (iya-sts#2028).
+pub const POLICIES_CHANGED_EVENT: &str = "urn:iya:sts:secevent:event-type:pep-policies-changed";
+
+/// How often the records are pushed while any are queued.
+const RECORDS_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the key file is checked.
+const KEY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// The background loop never sleeps longer than this, so `stop` and an
+/// event are prompt even if a notification is missed.
+const TICK: Duration = Duration::from_secs(1);
+
+/// Whether the host's signal stream can carry `pep-policies-changed`,
+/// reported on the heartbeat (D4) so the console shows a `local` PEP that
+/// would never hear of a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventStream {
+    /// The host has no signal stream (`signals: false`); the PEP polls.
+    None,
+    /// The stream is running and asked for the event type.
+    Requested,
+    /// The stream's configuration excludes the event type (the
+    /// application's `ssfEvents`).
+    Excluded,
+    /// The stream is not running or not healthy.
+    Down,
+}
+
+impl EventStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventStream::None => "none",
+            EventStream::Requested => "requested",
+            EventStream::Excluded => "excluded",
+            EventStream::Down => "down",
+        }
+    }
+}
+
+/// What the PEP is doing, for a host's health page. Holds no secret.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub name: String,
+    pub mode: Mode,
+    pub application: String,
+    pub registered: bool,
+    pub running: bool,
+    /// `local`: a compiled set is held.
+    pub holds_policy: bool,
+    pub policy_count: usize,
+    pub sync_token: String,
+    pub decisions: u64,
+    pub allowed: u64,
+    pub refused: u64,
+    pub unavailable: u64,
+    pub undischargeable: u64,
+    pub records_queued: usize,
+    pub key_thumbprint: String,
+    /// The last problem, or empty.
+    pub last_error: String,
+}
+
+#[derive(Default)]
+struct Counters {
+    decisions: AtomicU64,
+    allowed: AtomicU64,
+    refused: AtomicU64,
+    unavailable: AtomicU64,
+    undischargeable: AtomicU64,
+}
+
+#[derive(Default)]
+struct Wake {
+    pull: bool,
+    stop: bool,
+}
+
+pub(crate) struct Inner {
+    config: PepConfig,
+    credential: Credential,
+    instance: String,
+    registered: AtomicBool,
+    counters: Counters,
+    records: Records,
+    last_error: Mutex<String>,
+    event_stream: Mutex<EventStream>,
+    wake: Mutex<Wake>,
+    signal: Condvar,
+    permits: Mutex<HashMap<String, (Instant, Decision)>>,
+    #[cfg(feature = "local")]
+    held: RwLock<Option<Arc<crate::local::Held>>>,
+    #[cfg(not(feature = "local"))]
+    #[allow(dead_code)]
+    held: RwLock<Option<()>>,
+}
+
+/// The embedded PEP.
+pub struct Pep {
+    inner: Arc<Inner>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Pep {
+    /// Checks the configuration and reads the key. Sends nothing.
+    pub fn new(config: PepConfig) -> Result<Self, PepError> {
+        config.validate()?;
+        let client = Client::new(&config.tls_ca, Duration::from_millis(config.timeout_ms))?;
+        let credential = Credential::new(&config, client)?;
+        let instance = random_id();
+        let event_stream = if config.signals { EventStream::Requested } else { EventStream::None };
+        Ok(Self {
+            inner: Arc::new(Inner {
+                records: Records::new(instance.clone()),
+                instance,
+                credential,
+                registered: AtomicBool::new(false),
+                counters: Counters::default(),
+                last_error: Mutex::new(String::new()),
+                event_stream: Mutex::new(event_stream),
+                wake: Mutex::new(Wake::default()),
+                signal: Condvar::new(),
+                permits: Mutex::new(HashMap::new()),
+                held: RwLock::new(None),
+                config,
+            }),
+            worker: Mutex::new(None),
+        })
+    }
+
+    /// The configuration in force.
+    pub fn config(&self) -> &PepConfig {
+        &self.inner.config
+    }
+
+    /// The PEP key's RFC 7638 thumbprint. The host library refuses a
+    /// configuration where it equals one of its own keys' (D1).
+    pub fn key_thumbprint(&self) -> String {
+        self.inner.credential.thumbprint()
+    }
+
+    /// Starts the background work. The first registration and (in `local`)
+    /// the first pull are attempted before this returns, so a reachable
+    /// service gives a PEP that can decide at once; an unreachable one is
+    /// retried in the background, and decisions are `Unavailable` until then.
+    pub fn start(&self) -> Result<(), PepError> {
+        let mut worker = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        if worker.is_some() {
+            return Ok(());
+        }
+        self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).stop = false;
+        self.inner.register();
+        #[cfg(feature = "local")]
+        if self.inner.config.mode == Mode::Local {
+            self.inner.pull();
+        }
+        let inner = Arc::clone(&self.inner);
+        let handle = std::thread::Builder::new()
+            .name(format!("iya-pep {}", self.inner.config.name))
+            .spawn(move || inner.run())
+            .map_err(|err| PepError::new("config", format!("the PEP's thread could not start: {err}")))?;
+        *worker = Some(handle);
+        Ok(())
+    }
+
+    /// Stops the background work and waits for it. Queued records are sent
+    /// once more first.
+    pub fn stop(&self) {
+        let handle = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(handle) = handle {
+            self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+            self.inner.signal.notify_all();
+            let _ = handle.join();
+        }
+    }
+
+    /// Decides one access. Never fails: what can't be decided is
+    /// `Unavailable`.
+    pub fn decide(&self, subject: &Subject, access: &Access) -> Decision {
+        let decision = match self.inner.config.mode {
+            Mode::Central => self.inner.decide_central(subject, access),
+            Mode::Local => self.inner.decide_local(subject, access),
+        };
+        let c = &self.inner.counters;
+        c.decisions.fetch_add(1, Ordering::Relaxed);
+        match &decision {
+            Decision::Permit { .. } => c.allowed.fetch_add(1, Ordering::Relaxed),
+            Decision::Deny { .. } => c.refused.fetch_add(1, Ordering::Relaxed),
+            Decision::Unavailable { .. } => c.unavailable.fetch_add(1, Ordering::Relaxed),
+        };
+        decision
+    }
+
+    /// Hands over a verified `pep-policies-changed` event: the payload
+    /// under [`POLICIES_CHANGED_EVENT`] in the SET's `events`, after the host
+    /// library verified the SET as it verifies every other one. The event is
+    /// only a hint: `local` pulls with the PEP's own token, and the event's
+    /// `sync_token` is never trusted in place of a pull. `central` clears
+    /// its Permit cache. An event naming another PEP is ignored. Returns
+    /// whether it was acted on.
+    pub fn on_policy_event(&self, payload: &Value) -> bool {
+        if let Some(pep) = payload.get("pep").and_then(Value::as_str) {
+            if pep != self.inner.config.name {
+                return false;
+            }
+        }
+        self.inner.permits.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if self.inner.config.mode == Mode::Local {
+            self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).pull = true;
+            self.inner.signal.notify_all();
+        }
+        true
+    }
+
+    /// Tells the PEP what the host's signal stream can deliver, for the
+    /// heartbeat.
+    pub fn set_event_stream(&self, state: EventStream) {
+        *self.inner.event_stream.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+
+    /// Pulls now and waits for it (`local`). For a host that wants the
+    /// policy before it serves its first request.
+    pub fn pull_now(&self) -> Result<(), PepError> {
+        #[cfg(feature = "local")]
+        if self.inner.config.mode == Mode::Local {
+            return self.inner.pull_result();
+        }
+        Ok(())
+    }
+
+    pub fn status(&self) -> Status {
+        let inner = &self.inner;
+        let c = &inner.counters;
+        #[cfg(feature = "local")]
+        let (holds_policy, policy_count, sync_token) = match inner.held.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(h) => (true, h.policies.len(), h.policy_token.clone()),
+            None => (false, 0, String::new()),
+        };
+        #[cfg(not(feature = "local"))]
+        let (holds_policy, policy_count, sync_token) = (false, 0, String::new());
+        Status {
+            name: inner.config.name.clone(),
+            mode: inner.config.mode,
+            application: inner.config.application.clone(),
+            registered: inner.registered.load(Ordering::Relaxed),
+            running: self.worker.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            holds_policy,
+            policy_count,
+            sync_token,
+            decisions: c.decisions.load(Ordering::Relaxed),
+            allowed: c.allowed.load(Ordering::Relaxed),
+            refused: c.refused.load(Ordering::Relaxed),
+            unavailable: c.unavailable.load(Ordering::Relaxed),
+            undischargeable: c.undischargeable.load(Ordering::Relaxed),
+            records_queued: inner.records.queued(),
+            key_thumbprint: inner.credential.thumbprint(),
+            last_error: inner.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
+}
+
+impl Drop for Pep {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Inner {
+    fn base(&self) -> &str {
+        self.config.base()
+    }
+
+    fn note(&self, problem: &str) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = problem.to_string();
+    }
+
+    fn identity(&self) -> Value {
+        json!({
+            "name": self.config.name,
+            "kind": "embedded",
+            "application": self.config.application,
+            "mode": self.config.mode.as_str(),
+            "protocolVersion": PROTOCOL_VERSION,
+            "version": concat!("iya-pep-rust/", env!("CARGO_PKG_VERSION")),
+        })
+    }
+
+    fn register(&self) {
+        let url = format!("{}/xacml/pep/register", self.base());
+        match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&self.identity()))) {
+            Ok(answer) if answer.status == 200 || answer.status == 201 => {
+                self.registered.store(true, Ordering::Relaxed);
+                self.note("");
+            }
+            Ok(answer) => {
+                let json = answer.json().unwrap_or(Value::Null);
+                self.note(&format!(
+                    "registration answered {} {} {}",
+                    answer.status,
+                    json["error"].as_str().unwrap_or(""),
+                    json["error_description"].as_str().unwrap_or("")
+                ));
+            }
+            Err(err) => self.note(&format!("registration: {err}")),
+        }
+    }
+
+    /// One heartbeat. Returns whether the service says the PEP is not
+    /// current (a pull is due).
+    fn heartbeat(&self) -> bool {
+        let url = format!("{}/xacml/pep/heartbeat", self.base());
+        let c = &self.counters;
+        let mut body = self.identity();
+        #[cfg(feature = "local")]
+        if let Some(h) = self.held.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            body["syncToken"] = json!(h.policy_token);
+            body["policyCount"] = json!(h.policies.len());
+        }
+        body["decisions"] = json!(c.decisions.load(Ordering::Relaxed));
+        body["allowed"] = json!(c.allowed.load(Ordering::Relaxed));
+        body["refused"] = json!(c.refused.load(Ordering::Relaxed) + c.unavailable.load(Ordering::Relaxed));
+        body["undischargeable"] = json!(c.undischargeable.load(Ordering::Relaxed));
+        body["policyEvents"] = json!(self.event_stream.lock().unwrap_or_else(|e| e.into_inner()).as_str());
+        match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&body))) {
+            Ok(answer) if answer.status == 200 => answer.json().is_some_and(|j| j["current"] == json!(false)),
+            Ok(answer) if answer.status == 404 => {
+                self.registered.store(false, Ordering::Relaxed);
+                false
+            }
+            Ok(answer) => {
+                self.note(&format!("the heartbeat answered {}", answer.status));
+                false
+            }
+            Err(err) => {
+                self.note(&format!("the heartbeat: {err}"));
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "local")]
+    fn pull_result(&self) -> Result<(), PepError> {
+        let current = self.held.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let (_, fresh) = crate::local::pull(&self.credential, self.base(), &self.config.name, current.as_ref())?;
+        if let Some(fresh) = fresh {
+            *self.held.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(fresh));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "local")]
+    fn pull(&self) {
+        match self.pull_result() {
+            Ok(()) => self.note(""),
+            Err(err) => self.note(&format!("the pull: {err}")),
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        let now = Instant::now();
+        let mut next_heartbeat = now;
+        let mut next_records = now + RECORDS_INTERVAL;
+        let mut next_key = now + KEY_CHECK_INTERVAL;
+        let poll = Duration::from_millis(if self.config.signals { self.config.fallback_poll_ms } else { self.config.poll_interval_ms });
+        let mut next_pull = now + poll;
+        loop {
+            let pull_asked = {
+                let mut wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+                if !wake.stop && !wake.pull {
+                    wake = self.signal.wait_timeout(wake, TICK).map(|(g, _)| g).unwrap_or_else(|e| e.into_inner().0);
+                }
+                if wake.stop {
+                    break;
+                }
+                std::mem::take(&mut wake.pull)
+            };
+            let now = Instant::now();
+            if now >= next_key {
+                next_key = now + KEY_CHECK_INTERVAL;
+                if let Err(err) = self.credential.reload_key() {
+                    self.note(&format!("the assertion key: {err}"));
+                }
+            }
+            if !self.registered.load(Ordering::Relaxed) {
+                self.register();
+            }
+            let mut pull_due = pull_asked || now >= next_pull;
+            if now >= next_heartbeat {
+                next_heartbeat = now + Duration::from_millis(self.config.heartbeat_interval_ms);
+                pull_due |= self.heartbeat();
+            }
+            if pull_due && self.config.mode == Mode::Local {
+                next_pull = Instant::now() + poll;
+                #[cfg(feature = "local")]
+                self.pull();
+            }
+            if now >= next_records {
+                next_records = now + RECORDS_INTERVAL;
+                self.ship_records();
+            }
+        }
+        self.ship_records();
+    }
+
+    fn ship_records(&self) {
+        if self.records.queued() == 0 {
+            return;
+        }
+        let url = format!("{}/admin-api/pep-audit", self.base());
+        if let Err(err) = self.records.ship(&self.credential, &url) {
+            self.note(&format!("the decision records: {err}"));
+        }
+    }
+
+    fn decide_central(&self, subject: &Subject, access: &Access) -> Decision {
+        let body = evaluation_body(subject, access, &self.config.application, &self.config.supported_obligations);
+        let cache_for = Duration::from_millis(self.config.permit_cache_ms);
+        let cache_key = body.to_string();
+        if !cache_for.is_zero() {
+            let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
+            match permits.get(&cache_key) {
+                Some((at, decision)) if at.elapsed() < cache_for => return decision.clone(),
+                Some(_) => {
+                    permits.remove(&cache_key);
+                }
+                None => {}
+            }
+        }
+        let url = format!("{}/access/v1/evaluation", self.base());
+        let answer = match self.credential.call(Audience::Access, "POST", &url, "application/json", &[], Some(&Body::Json(&body))) {
+            Ok(answer) => answer,
+            Err(err) => return Decision::Unavailable { why: format!("the service could not be asked: {err}") },
+        };
+        let json = answer.json().unwrap_or(Value::Null);
+        let decision = match (answer.status, json.get("decision").and_then(Value::as_bool)) {
+            (200, Some(true)) => Decision::Permit {
+                obligations: json["context"]["obligations"].as_array().map(|list| list.iter().filter_map(obligation_from).collect()).unwrap_or_default(),
+                advice: Vec::new(),
+            },
+            (200, Some(false)) => {
+                if json["context"]["undischargeable_obligations"].as_array().is_some_and(|l| !l.is_empty()) {
+                    self.counters.undischargeable.fetch_add(1, Ordering::Relaxed);
+                }
+                Decision::Deny { why: reason(&json).unwrap_or_else(|| "the service denied the access".into()) }
+            }
+            (400, _) => Decision::Deny {
+                why: format!(
+                    "the service refused the evaluation: {} {}",
+                    json["error"].as_str().or(json["code"].as_str()).unwrap_or(""),
+                    json["error_description"].as_str().or(json["message"].as_str()).unwrap_or("")
+                )
+                .trim_end()
+                .to_string(),
+            },
+            (status, _) => Decision::Unavailable { why: format!("the service answered {status} to the evaluation") },
+        };
+        if !cache_for.is_zero() && decision.is_permit() {
+            self.permits.lock().unwrap_or_else(|e| e.into_inner()).insert(cache_key, (Instant::now(), decision.clone()));
+        }
+        decision
+    }
+
+    #[cfg(not(feature = "local"))]
+    fn decide_local(&self, _subject: &Subject, _access: &Access) -> Decision {
+        Decision::Unavailable { why: "this build has no engine (the iya-pep `local` feature)".into() }
+    }
+
+    #[cfg(feature = "local")]
+    fn decide_local(&self, subject: &Subject, access: &Access) -> Decision {
+        let Some(held) = self.held.read().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return Decision::Unavailable { why: "no policy is held yet".into() };
+        };
+        let body = evaluation_body(subject, access, &self.config.application, &self.config.supported_obligations);
+        let trusted = crate::authzen::Trusted { realm: self.config.realm(), caller: self.config.name.clone(), application: self.config.application.clone() };
+        let made = crate::local::decide(&self.credential, self.base(), &held, &body, &trusted, &subject.id, subject.kind == "application", std::time::SystemTime::now());
+        if let Some(outcome) = &made.outcome {
+            if !outcome.undischargeable.is_empty() {
+                self.counters.undischargeable.fetch_add(1, Ordering::Relaxed);
+            }
+            if self.config.decision_records {
+                self.records.push(json!({
+                    "kind": "authzen",
+                    "endpoint": "evaluation",
+                    "decision": outcome.xacml_decision.as_str(),
+                    "allowed": made.decision.is_permit(),
+                    "fault": outcome.fault,
+                    "subject": subject.id,
+                    "subjectType": subject.kind,
+                    "resource": format!("{}:{}", access.resource_type, access.resource_id),
+                    "action": access.action,
+                    "application": self.config.application,
+                    "caller": self.config.name,
+                    "bias": "deny-biased",
+                    "why": outcome.why,
+                    "discharged": outcome.discharged,
+                    "undischargeable": outcome.undischargeable,
+                }));
+            }
+        }
+        made.decision
+    }
+}
+
+fn reason(json: &Value) -> Option<String> {
+    let context = json.get("context")?;
+    for key in ["reason_admin", "reason_user"] {
+        match context.get(key) {
+            Some(Value::String(s)) if !s.is_empty() => return Some(s.clone()),
+            Some(Value::Object(map)) => {
+                if let Some(text) = map.values().find_map(Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(feature = "tokio")]
+mod async_api {
+    use super::*;
+
+    async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, PepError> {
+        tokio::task::spawn_blocking(work).await.map_err(|err| PepError::new("transport", format!("the blocking call did not complete: {err}")))
+    }
+
+    impl Pep {
+        /// `start`, off the runtime's threads.
+        pub async fn start_async(self: &Arc<Self>) -> Result<(), PepError> {
+            let pep = Arc::clone(self);
+            blocking(move || pep.start()).await?
+        }
+
+        /// `decide`, off the runtime's threads (`central` is a network call,
+        /// and `local` may ask the PIP).
+        pub async fn decide_async(self: &Arc<Self>, subject: Subject, access: Access) -> Decision {
+            let pep = Arc::clone(self);
+            blocking(move || pep.decide(&subject, &access)).await.unwrap_or_else(|err| Decision::Unavailable { why: err.message })
+        }
+
+        /// `stop`, off the runtime's threads.
+        pub async fn stop_async(self: &Arc<Self>) {
+            let pep = Arc::clone(self);
+            let _ = blocking(move || pep.stop()).await;
+        }
+    }
+}
