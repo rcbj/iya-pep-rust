@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
 // SPDX-License-Identifier: MIT
 
-//! `src/authzen.rs` held to `tests/authzen/authzen_cases.json`, the table
-//! iya-sts's `authzen/authzen_map.ts` (`tests/authzen_map.js` S) and the
-//! container PEP's `authzen_map.rs` are held to, run the way the container
-//! runs it.
+//! `src/authzen.rs` held to `tests/authzen/cases.json`, this crate's own
+//! table of the AuthZEN mapping (MIT), written here from the meaning of the
+//! STS-AUTHZEN codes and the published value rules, not copied from any
+//! other implementation's table.
 //!
 //! - `catalogue`: each value read as a row, accepted or refused with the
 //!   case's code.
@@ -14,10 +14,9 @@
 //! - `obligations`: each XACML answer mapped back under the case's profile
 //!   switch and declaration: the decision, the types handed and the number
 //!   of problems.
-//! - `binding` is SKIPPED: it holds which tuples the service answers by the
-//!   OAuth token-exchange binding's fixed rules (and the container answers
-//!   501). An embedded PEP never evaluates a token-exchange gate, so the
-//!   section has nothing here to hold.
+//!
+//! There is no token-exchange binding section: an embedded PEP never
+//! evaluates a token-exchange gate.
 //!
 //! Every mismatch is collected and the test fails once, listing them all.
 
@@ -44,7 +43,7 @@ const FIXED: [&str; 10] = [
 ];
 
 fn table() -> Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/authzen/authzen_cases.json");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/authzen/cases.json");
     serde_json::from_str(&std::fs::read_to_string(path).expect("the table")).expect("the table is JSON")
 }
 
@@ -204,14 +203,14 @@ fn run_obligations(table: &Value, failures: &mut Vec<String>) -> usize {
 }
 
 #[test]
-fn agrees_with_the_shared_authzen_table() {
+fn agrees_with_the_authzen_table() {
     let table = table();
     let mut failures = Vec::new();
     let catalogue = run_catalogue(&table, &mut failures);
     let requests = run_requests(&table, &mut failures);
     let obligations = run_obligations(&table, &mut failures);
     eprintln!(
-        "authzen_cases: catalogue {}/{}, requests {}/{}, obligations {}/{}; binding skipped (token exchange)",
+        "authzen cases: catalogue {}/{}, requests {}/{}, obligations {}/{}",
         catalogue,
         table["catalogue"].as_array().map_or(0, Vec::len),
         requests,
@@ -258,10 +257,10 @@ fn builds_the_request_the_container_builds() {
     let rows: Vec<Row> = table["rows"].as_array().unwrap().iter().map(|v| Row::read(v).unwrap()).collect();
     let catalogue = Catalogue { rows, obligations_profile: false, ..Default::default() };
     let body = json!({
-        "subject": { "type": "user", "id": "alice", "properties": { "clearance": 4 } },
+        "subject": { "type": "user", "id": "alice", "properties": { "tier": 4 } },
         "action": { "name": "read" },
         "resource": { "type": "document", "id": "doc-1" },
-        "context": { "application": "portal", "source_ip": "192.0.2.25" }
+        "context": { "application": "portal", "client_ip": "192.0.2.25" }
     });
     let mapped = map_evaluation(&body, &catalogue, &trusted()).unwrap();
     let request = &mapped.request;
@@ -276,7 +275,7 @@ fn builds_the_request_the_container_builds() {
         vec![
             (
                 "urn:oasis:names:tc:xacml:1.0:subject-category:access-subject",
-                vec!["urn:oasis:names:tc:xacml:1.0:subject:subject-id", "urn:sts:xacml:authzen:subject-type", "urn:example:clearance"]
+                vec!["urn:oasis:names:tc:xacml:1.0:subject:subject-id", "urn:sts:xacml:authzen:subject-type", "urn:example:pep:tier"]
             ),
             ("urn:oasis:names:tc:xacml:3.0:attribute-category:action", vec!["urn:oasis:names:tc:xacml:1.0:action:action-id"]),
             (
@@ -291,16 +290,16 @@ fn builds_the_request_the_container_builds() {
                     "urn:sts:xacml:authzen:caller",
                     "urn:sts:xacml:authzen:application",
                     SUPPLIED,
-                    "urn:example:source-ip"
+                    "urn:example:pep:client-ip"
                 ]
             ),
         ]
     );
     let all: Vec<_> = request.categories.iter().flat_map(|c| &c.attributes).collect();
     assert!(all.iter().all(|a| a.include_in_result && a.issuer.is_none()));
-    let clearance = all.iter().find(|a| a.attribute_id == "urn:example:clearance").unwrap();
-    assert_eq!(clearance.values[0].data_type, "http://www.w3.org/2001/XMLSchema#integer");
-    assert_eq!(clearance.values[0].value, "4");
+    let tier = all.iter().find(|a| a.attribute_id == "urn:example:pep:tier").unwrap();
+    assert_eq!(tier.values[0].data_type, "http://www.w3.org/2001/XMLSchema#integer");
+    assert_eq!(tier.values[0].value, "4");
 
     let bare = Trusted { realm: String::new(), caller: "c".into(), application: String::new(), ..Default::default() };
     let body = json!({ "subject": { "type": "user", "id": "a" }, "action": { "name": "r" }, "resource": { "type": "d", "id": "1" } });

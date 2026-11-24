@@ -10,7 +10,7 @@
 //! `authzen/authzen_map.ts` and the container PEP's `authzen_map.rs` map it,
 //! through the realm's attribute catalogue (`GET /xacml/pep/authzen-catalogue`),
 //! and the outcome is fail-closed in the same way. `tests/authzen_cases.rs`
-//! holds this file to the table the other two are held to.
+//! holds this file to this crate's own table, `tests/authzen/cases.json`.
 //!
 //! THIS MODULE'S PUBLIC ITEMS ARE THE CONTRACT with `src/local.rs`.
 //!

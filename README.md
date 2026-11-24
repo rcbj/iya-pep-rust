@@ -78,7 +78,7 @@ docker build --target test .
 ```
 
 - **The engine:** it must match the reference engine on every case of the pinned corpus (`tests/corpus/`, iya-sts's `xacml/pep-corpus` version 1).
-- **The AuthZEN mapping:** held to the table the service and the container PEP are held to (`tests/authzen/`).
+- **The AuthZEN mapping:** held to this crate's own table, `tests/authzen/cases.json` (MIT, original here): catalogue rows, request bodies and obligation answers, each expectation taken from the meaning of its STS-AUTHZEN code.
 - **Both modes and the control plane:** run against a stub PDP (`tests/central.rs`, `tests/local.rs`).
 
 ## License
