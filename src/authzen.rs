@@ -472,6 +472,10 @@ pub struct Catalogue {
     pub rows: Vec<Row>,
     /// The realm's `authzen.obligationsProfile`.
     pub obligations_profile: bool,
+    /// `fgaApplications`: the applications that enforce fine-grained
+    /// authorization. An evaluation about one of them carries two more facts
+    /// (see [`Trusted::fga`]).
+    pub fga_applications: Vec<String>,
 }
 
 impl Catalogue {
@@ -500,8 +504,33 @@ impl Catalogue {
             }
         }
         let obligations_profile = body.pointer("/settings/obligationsProfile").and_then(Value::as_bool).unwrap_or(false);
-        Ok(Catalogue { rows, obligations_profile })
+        let fga_applications = body
+            .get("fgaApplications")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        Ok(Catalogue { rows, obligations_profile, fga_applications })
     }
+}
+
+/// The two facts the service adds to an evaluation about an application
+/// that enforces fine-grained authorization.
+fn add_fga_access(request: &mut engine::Request, application: &str) {
+    let include = request.categories.iter().flat_map(|c| c.attributes.iter()).map(|a| a.include_in_result).next().unwrap_or(true);
+    let mut put = |category: &str, attribute_id: &str, value: &str| {
+        let attribute = engine::Attribute {
+            attribute_id: attribute_id.to_string(),
+            issuer: None,
+            include_in_result: include,
+            values: if value.is_empty() { Vec::new() } else { vec![engine::AttributeValue::string(value)] },
+        };
+        match request.categories.iter_mut().find(|c| c.category == category) {
+            Some(c) => c.attributes.push(attribute),
+            None => request.categories.push(engine::Category { category: category.to_string(), has_content: false, attributes: vec![attribute] }),
+        }
+    };
+    put(engine::RESOURCE, "urn:sts:xacml:fga:application", application);
+    put(engine::ENVIRONMENT, "urn:sts:xacml:fga:stage", "access");
 }
 
 /// What the PEP knows about the call, written into the request as trusted
@@ -514,6 +543,13 @@ pub struct Trusted {
     pub caller: String,
     /// The bound application.
     pub application: String,
+    /// The bound application enforces fine-grained authorization: the
+    /// service decides it against its own policy, with two more facts, which
+    /// the request then carries here too (`urn:sts:xacml:fga:application`
+    /// in the resource, `urn:sts:xacml:fga:stage` = `access` in the
+    /// environment), after every other attribute, as the service's builder
+    /// writes them (`fgaAccess()`).
+    pub fga: bool,
 }
 
 /// One evaluation, mapped.
@@ -1070,7 +1106,10 @@ pub fn map_evaluation(body: &Value, catalogue: &Catalogue, trusted: &Trusted) ->
             message: format!("context.application \"{}\" is not an application this PEP may ask about.", clip(&reading.application, 120)),
         });
     }
-    let request = build_request(&reading, trusted);
+    let mut request = build_request(&reading, trusted);
+    if trusted.fga {
+        add_fga_access(&mut request, &trusted.application);
+    }
     Ok(Mapped { request, supported_obligations: reading.supported_obligations })
 }
 

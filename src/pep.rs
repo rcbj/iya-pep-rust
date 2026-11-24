@@ -716,7 +716,12 @@ impl Inner {
         };
         let roots: HashSet<String> = held.catalogue.rows.iter().filter(|r| r.object == "subject").map(|r| root_of(&r.property)).collect();
         let body = evaluation_body(&declared_only(subject, &roots), access, &self.config.application, &self.config.supported_obligations);
-        let trusted = crate::authzen::Trusted { realm: self.config.realm(), caller: self.config.name.clone(), application: self.config.application.clone() };
+        let trusted = crate::authzen::Trusted {
+            realm: self.config.realm(),
+            caller: self.config.name.clone(),
+            application: self.config.application.clone(),
+            fga: held.catalogue.fga_applications.contains(&self.config.application),
+        };
         let made = crate::local::decide(&self.credential, self.base(), &held, &body, &trusted, &subject.id, subject.kind == "application", std::time::SystemTime::now());
         if let Some(outcome) = &made.outcome {
             if !outcome.undischargeable.is_empty() {

@@ -50,7 +50,7 @@ fn table() -> Value {
 
 /// The trusted facts the container's own test uses.
 fn trusted() -> Trusted {
-    Trusted { realm: "acme".into(), caller: "cn=pep-1,ou=users,dc=acme".into(), application: "portal".into() }
+    Trusted { realm: "acme".into(), caller: "cn=pep-1,ou=users,dc=acme".into(), application: "portal".into(), ..Default::default() }
 }
 
 fn what(case: &Value) -> String {
@@ -100,7 +100,7 @@ fn run_catalogue(table: &Value, failures: &mut Vec<String>) -> usize {
 
 fn run_requests(table: &Value, failures: &mut Vec<String>) -> usize {
     let rows: Vec<Row> = table["rows"].as_array().expect("rows").iter().map(|v| Row::read(v).expect("a table row reads")).collect();
-    let catalogue = Catalogue { rows, obligations_profile: false };
+    let catalogue = Catalogue { rows, obligations_profile: false, ..Default::default() };
     let cases = table["requests"].as_array().expect("request cases");
     let mut passed = 0;
     for case in cases {
@@ -256,7 +256,7 @@ fn hands_a_step_up_in_the_services_shape() {
 fn builds_the_request_the_container_builds() {
     let table = table();
     let rows: Vec<Row> = table["rows"].as_array().unwrap().iter().map(|v| Row::read(v).unwrap()).collect();
-    let catalogue = Catalogue { rows, obligations_profile: false };
+    let catalogue = Catalogue { rows, obligations_profile: false, ..Default::default() };
     let body = json!({
         "subject": { "type": "user", "id": "alice", "properties": { "clearance": 4 } },
         "action": { "name": "read" },
@@ -302,7 +302,7 @@ fn builds_the_request_the_container_builds() {
     assert_eq!(clearance.values[0].data_type, "http://www.w3.org/2001/XMLSchema#integer");
     assert_eq!(clearance.values[0].value, "4");
 
-    let bare = Trusted { realm: String::new(), caller: "c".into(), application: String::new() };
+    let bare = Trusted { realm: String::new(), caller: "c".into(), application: String::new(), ..Default::default() };
     let body = json!({ "subject": { "type": "user", "id": "a" }, "action": { "name": "r" }, "resource": { "type": "d", "id": "1" } });
     let mapped = map_evaluation(&body, &catalogue, &bare).unwrap();
     let env = mapped.request.categories.iter().find(|c| c.category.ends_with(":environment")).unwrap();
@@ -334,4 +334,23 @@ fn reads_a_pulled_catalogue() {
     assert!(catalogue.obligations_profile);
     assert!(!Catalogue::from_pull(&json!({ "rows": [] })).unwrap().obligations_profile);
     assert!(Catalogue::from_pull(&json!({})).is_err());
+}
+
+/// An application that enforces fine-grained authorization: the request
+/// carries the two facts the service adds, after everything else.
+#[test]
+fn an_fga_application_gets_the_services_two_facts() {
+    let catalogue = Catalogue::from_pull(&json!({"rows": [], "settings": {}, "fgaApplications": ["portal"]})).unwrap();
+    assert_eq!(catalogue.fga_applications, vec!["portal".to_string()]);
+    let body = json!({"subject": {"type": "user", "id": "alice"}, "action": {"name": "read"}, "resource": {"type": "doc", "id": "1"}});
+    let plain = map_evaluation(&body, &catalogue, &trusted()).unwrap().request;
+    let fga = map_evaluation(&body, &catalogue, &Trusted { fga: true, ..trusted() }).unwrap().request;
+    let find = |r: &iya_pep::engine::Request, category: &str, id: &str| -> Option<Vec<String>> {
+        r.categories.iter().filter(|c| c.category == category).flat_map(|c| c.attributes.iter()).find(|a| a.attribute_id == id).map(|a| a.values.iter().map(|v| v.value.clone()).collect())
+    };
+    assert_eq!(find(&plain, iya_pep::engine::RESOURCE, "urn:sts:xacml:fga:application"), None);
+    assert_eq!(find(&fga, iya_pep::engine::RESOURCE, "urn:sts:xacml:fga:application"), Some(vec!["portal".to_string()]));
+    assert_eq!(find(&fga, iya_pep::engine::ENVIRONMENT, "urn:sts:xacml:fga:stage"), Some(vec!["access".to_string()]));
+    let last_resource = fga.categories.iter().find(|c| c.category == iya_pep::engine::RESOURCE).unwrap().attributes.last().unwrap();
+    assert_eq!(last_resource.attribute_id, "urn:sts:xacml:fga:application", "after every other resource attribute, as the service writes it");
 }
