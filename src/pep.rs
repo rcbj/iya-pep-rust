@@ -16,7 +16,7 @@
 //!   - the key file, read again when it changes
 //! - **`decide`** never fails: a decision it can't make is `Unavailable`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -94,7 +94,8 @@ pub struct Status {
     pub undischargeable: u64,
     pub records_queued: usize,
     pub key_thumbprint: String,
-    /// The last problem, or empty.
+    /// The current problems, one per area (registration, pull, heartbeat,
+    /// records, key), joined; empty when there are none.
     pub last_error: String,
 }
 
@@ -119,11 +120,15 @@ pub(crate) struct Inner {
     registered: AtomicBool,
     counters: Counters,
     records: Records,
-    last_error: Mutex<String>,
+    problems: Mutex<std::collections::BTreeMap<&'static str, String>>,
     event_stream: Mutex<EventStream>,
     wake: Mutex<Wake>,
     signal: Condvar,
     permits: Mutex<HashMap<String, (Instant, Decision)>>,
+    /// `central`: the catalogue's subject properties and its token. The
+    /// service refuses an evaluation naming a property its catalogue does
+    /// not declare, so only these of a subject's claims are sent.
+    subject_roots: RwLock<(String, Arc<HashSet<String>>)>,
     #[cfg(feature = "local")]
     held: RwLock<Option<Arc<crate::local::Held>>>,
     #[cfg(not(feature = "local"))]
@@ -151,11 +156,12 @@ impl Pep {
                 credential,
                 registered: AtomicBool::new(false),
                 counters: Counters::default(),
-                last_error: Mutex::new(String::new()),
+                problems: Mutex::new(std::collections::BTreeMap::new()),
                 event_stream: Mutex::new(event_stream),
                 wake: Mutex::new(Wake::default()),
                 signal: Condvar::new(),
                 permits: Mutex::new(HashMap::new()),
+                subject_roots: RwLock::new((String::new(), Arc::new(HashSet::new()))),
                 held: RwLock::new(None),
                 config,
             }),
@@ -193,10 +199,7 @@ impl Pep {
         }
         self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).stop = false;
         self.inner.register();
-        #[cfg(feature = "local")]
-        if self.inner.config.mode == Mode::Local {
-            self.inner.pull();
-        }
+        self.inner.pull();
         let inner = Arc::clone(&self.inner);
         let handle = std::thread::Builder::new()
             .name(format!("iya-pep {}", self.inner.config.name))
@@ -248,10 +251,8 @@ impl Pep {
             }
         }
         self.inner.permits.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        if self.inner.config.mode == Mode::Local {
-            self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).pull = true;
-            self.inner.signal.notify_all();
-        }
+        self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).pull = true;
+        self.inner.signal.notify_all();
         true
     }
 
@@ -264,11 +265,7 @@ impl Pep {
     /// Pulls now and waits for it (`local`). For a host that wants the
     /// policy before it serves its first request.
     pub fn pull_now(&self) -> Result<(), PepError> {
-        #[cfg(feature = "local")]
-        if self.inner.config.mode == Mode::Local {
-            return self.inner.pull_result();
-        }
-        Ok(())
+        self.inner.pull_result()
     }
 
     pub fn status(&self) -> Status {
@@ -297,7 +294,7 @@ impl Pep {
             undischargeable: c.undischargeable.load(Ordering::Relaxed),
             records_queued: inner.records.queued(),
             key_thumbprint: inner.credential.thumbprint(),
-            last_error: inner.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            last_error: inner.problems.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect::<Vec<_>>().join("; "),
         }
     }
 }
@@ -313,8 +310,14 @@ impl Inner {
         self.config.base()
     }
 
-    fn note(&self, problem: &str) {
-        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = problem.to_string();
+    /// Records the problem of one area, or clears it with an empty one.
+    fn note(&self, area: &'static str, problem: &str) {
+        let mut problems = self.problems.lock().unwrap_or_else(|e| e.into_inner());
+        if problem.is_empty() {
+            problems.remove(area);
+        } else {
+            problems.insert(area, problem.to_string());
+        }
     }
 
     fn identity(&self) -> Value {
@@ -333,18 +336,18 @@ impl Inner {
         match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&self.identity()))) {
             Ok(answer) if answer.status == 200 || answer.status == 201 => {
                 self.registered.store(true, Ordering::Relaxed);
-                self.note("");
+                self.note("register", "");
             }
             Ok(answer) => {
                 let json = answer.json().unwrap_or(Value::Null);
-                self.note(&format!(
+                self.note("register", &format!(
                     "registration answered {} {} {}",
                     answer.status,
                     json["error"].as_str().unwrap_or(""),
                     json["error_description"].as_str().unwrap_or("")
                 ));
             }
-            Err(err) => self.note(&format!("registration: {err}")),
+            Err(err) => self.note("register", &format!("registration: {err}")),
         }
     }
 
@@ -365,37 +368,48 @@ impl Inner {
         body["undischargeable"] = json!(c.undischargeable.load(Ordering::Relaxed));
         body["policyEvents"] = json!(self.event_stream.lock().unwrap_or_else(|e| e.into_inner()).as_str());
         match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&body))) {
-            Ok(answer) if answer.status == 200 => answer.json().is_some_and(|j| j["current"] == json!(false)),
+            Ok(answer) if answer.status == 200 => {
+                self.note("heartbeat", "");
+                answer.json().is_some_and(|j| j["current"] == json!(false))
+            }
             Ok(answer) if answer.status == 404 => {
                 self.registered.store(false, Ordering::Relaxed);
                 false
             }
             Ok(answer) => {
-                self.note(&format!("the heartbeat answered {}", answer.status));
+                self.note("heartbeat", &format!("the heartbeat answered {}", answer.status));
                 false
             }
             Err(err) => {
-                self.note(&format!("the heartbeat: {err}"));
+                self.note("heartbeat", &format!("the heartbeat: {err}"));
                 false
             }
         }
     }
 
-    #[cfg(feature = "local")]
+    /// `local`: the policies and the catalogue. `central`: the catalogue
+    /// alone, for the subject properties it declares.
     fn pull_result(&self) -> Result<(), PepError> {
-        let current = self.held.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let (_, fresh) = crate::local::pull(&self.credential, self.base(), &self.config.name, current.as_ref())?;
-        if let Some(fresh) = fresh {
-            *self.held.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(fresh));
+        #[cfg(feature = "local")]
+        if self.config.mode == Mode::Local {
+            let current = self.held.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let (_, fresh) = crate::local::pull(&self.credential, self.base(), &self.config.name, current.as_ref())?;
+            if let Some(fresh) = fresh {
+                *self.held.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(fresh));
+            }
+            return Ok(());
+        }
+        let token = self.subject_roots.read().unwrap_or_else(|e| e.into_inner()).0.clone();
+        if let Some(fresh) = crate::decision::pull_subject_roots(&self.credential, self.base(), &token)? {
+            *self.subject_roots.write().unwrap_or_else(|e| e.into_inner()) = (fresh.0, Arc::new(fresh.1));
         }
         Ok(())
     }
 
-    #[cfg(feature = "local")]
     fn pull(&self) {
         match self.pull_result() {
-            Ok(()) => self.note(""),
-            Err(err) => self.note(&format!("the pull: {err}")),
+            Ok(()) => self.note("pull", ""),
+            Err(err) => self.note("pull", &format!("the pull: {err}")),
         }
     }
 
@@ -420,8 +434,9 @@ impl Inner {
             let now = Instant::now();
             if now >= next_key {
                 next_key = now + KEY_CHECK_INTERVAL;
-                if let Err(err) = self.credential.reload_key() {
-                    self.note(&format!("the assertion key: {err}"));
+                match self.credential.reload_key() {
+                    Ok(_) => self.note("key", ""),
+                    Err(err) => self.note("key", &format!("the assertion key: {err}")),
                 }
             }
             if !self.registered.load(Ordering::Relaxed) {
@@ -432,9 +447,8 @@ impl Inner {
                 next_heartbeat = now + Duration::from_millis(self.config.heartbeat_interval_ms);
                 pull_due |= self.heartbeat();
             }
-            if pull_due && self.config.mode == Mode::Local {
+            if pull_due {
                 next_pull = Instant::now() + poll;
-                #[cfg(feature = "local")]
                 self.pull();
             }
             if now >= next_records {
@@ -450,13 +464,15 @@ impl Inner {
             return;
         }
         let url = format!("{}/admin-api/pep-audit", self.base());
-        if let Err(err) = self.records.ship(&self.credential, &url) {
-            self.note(&format!("the decision records: {err}"));
+        match self.records.ship(&self.credential, &url) {
+            Ok(_) => self.note("records", ""),
+            Err(err) => self.note("records", &format!("the decision records: {err}")),
         }
     }
 
     fn decide_central(&self, subject: &Subject, access: &Access) -> Decision {
-        let body = evaluation_body(subject, access, &self.config.application, &self.config.supported_obligations);
+        let roots = self.subject_roots.read().unwrap_or_else(|e| e.into_inner()).1.clone();
+        let body = evaluation_body(&declared_only(subject, &roots), access, &self.config.application, &self.config.supported_obligations);
         let cache_for = Duration::from_millis(self.config.permit_cache_ms);
         let cache_key = body.to_string();
         if !cache_for.is_zero() {
@@ -513,7 +529,8 @@ impl Inner {
         let Some(held) = self.held.read().unwrap_or_else(|e| e.into_inner()).clone() else {
             return Decision::Unavailable { why: "no policy is held yet".into() };
         };
-        let body = evaluation_body(subject, access, &self.config.application, &self.config.supported_obligations);
+        let roots: HashSet<String> = held.catalogue.rows.iter().filter(|r| r.object == "subject").map(|r| root_of(&r.property)).collect();
+        let body = evaluation_body(&declared_only(subject, &roots), access, &self.config.application, &self.config.supported_obligations);
         let trusted = crate::authzen::Trusted { realm: self.config.realm(), caller: self.config.name.clone(), application: self.config.application.clone() };
         let made = crate::local::decide(&self.credential, self.base(), &held, &body, &trusted, &subject.id, subject.kind == "application", std::time::SystemTime::now());
         if let Some(outcome) = &made.outcome {
@@ -542,6 +559,20 @@ impl Inner {
         }
         made.decision
     }
+}
+
+/// A dotted property path's first segment.
+pub(crate) fn root_of(property: &str) -> String {
+    property.split('.').next().unwrap_or("").to_string()
+}
+
+/// `subject` with only the properties the catalogue declares. The service
+/// refuses an evaluation that names any other (STS-AUTHZEN-0004), so a
+/// host may hand every claim it has.
+fn declared_only(subject: &Subject, roots: &HashSet<String>) -> Subject {
+    let mut out = subject.clone();
+    out.properties.retain(|name, _| roots.contains(name));
+    out
 }
 
 fn reason(json: &Value) -> Option<String> {

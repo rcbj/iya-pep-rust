@@ -68,12 +68,23 @@ fn the_evaluation_carries_the_bound_application_and_the_subjects_claims() {
     let stub = Stub::start();
     let mut c = config(&stub, "body");
     c.supported_obligations = vec!["step-up".into()];
+    stub.script.lock().unwrap().catalogue_rows = vec![json!({"object": "subject", "property": "acr", "attributeId": "urn:example:acr"})];
     let pep = Pep::new(c).unwrap();
+    pep.pull_now().unwrap();
     let mut access = read_42();
     access.context.insert("application".into(), json!("another-app"));
-    pep.decide(&alice(), &access);
+    let mut subject = alice();
+    subject.properties.insert("email".into(), json!("alice@example.com"));
+    pep.decide(&subject, &access);
     let body = stub.seen("/access/v1/evaluation")[0].json();
-    assert_eq!(body["subject"], json!({"type": "user", "id": "alice", "properties": {"acr": "urn:example:mfa"}}));
+    assert_eq!(
+        body["subject"],
+        json!({"type": "user", "id": "alice", "properties": {"acr": "urn:example:mfa"}}),
+        "a claim the catalogue doesn't declare is not sent: the service would refuse the evaluation"
+    );
+    assert_eq!(stub.seen("/xacml/pep/authzen-catalogue")[0].header("Authorization").map(|a| a.starts_with("DPoP ")), Some(true));
+    pep.pull_now().unwrap();
+    assert_eq!(stub.seen("/xacml/pep/authzen-catalogue")[1].header("If-None-Match"), Some("\"c1\""));
     assert_eq!(body["action"], json!({"name": "read"}));
     assert_eq!(body["resource"], json!({"type": "order", "id": "42"}));
     assert_eq!(body["context"]["application"], APP, "the PEP's binding, never the caller's");

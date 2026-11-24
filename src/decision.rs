@@ -111,6 +111,31 @@ pub fn obligation_from(value: &Value) -> Option<Obligation> {
     })
 }
 
+/// `central`: pulls the catalogue and answers its token and the subject
+/// properties it declares, or `None` on `304`.
+pub(crate) fn pull_subject_roots(credential: &crate::credential::Credential, base: &str, token: &str) -> Result<Option<(String, std::collections::HashSet<String>)>, crate::error::PepError> {
+    use crate::error::PepError;
+    let url = format!("{base}/xacml/pep/authzen-catalogue");
+    let extra = if token.is_empty() { Vec::new() } else { vec![("If-None-Match", format!("\"{token}\""))] };
+    let answer = credential.call(crate::credential::Audience::Pep, "GET", &url, "application/json", &extra, None)?;
+    match answer.status {
+        304 if !token.is_empty() => Ok(None),
+        200 => {
+            let json = answer.json().ok_or_else(|| PepError::new("policy", "the catalogue pull is not JSON"))?;
+            let rows = json["rows"].as_array().ok_or_else(|| PepError::new("policy", "the catalogue pull has no rows array"))?;
+            let roots = rows
+                .iter()
+                .filter(|r| r["object"] == "subject")
+                .filter_map(|r| r["property"].as_str())
+                .map(crate::pep::root_of)
+                .collect();
+            let token = json["syncToken"].as_str().unwrap_or("").to_string();
+            Ok(Some((token, roots)))
+        }
+        status => Err(PepError::new("refused", format!("the catalogue pull answered {status}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
