@@ -10,4 +10,6 @@
 //! `pep-policies-changed` events from its Shared Signals stream.
 
 #[cfg(feature = "local")]
+pub mod authzen;
+#[cfg(feature = "local")]
 pub mod engine;
