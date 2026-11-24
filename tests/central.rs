@@ -289,3 +289,35 @@ fn a_configuration_from_json_runs() {
     let c = PepConfig::from_json(&section, &stub.base, APP).unwrap();
     assert!(Pep::new(c).unwrap().decide(&alice(), &read_42()).is_permit());
 }
+
+#[test]
+fn advice_in_the_answers_context_is_handed_as_local_hands_it() {
+    // The service sends advice under context only while the realm's
+    // authzen.returnReasons is on; when it does, central hands it in the
+    // shape local hands the engine's: the id as kind, each attribute a
+    // property, a repeated one an array.
+    let stub = Stub::start();
+    let pep = Pep::new(config(&stub, "advice")).unwrap();
+    stub.script.lock().unwrap().evaluations.push_back((
+        200,
+        json!({"decision": true, "context": {"xacml_decision": "Permit", "advice": [
+            {"id": "urn:example:advice:banner", "attributes": [
+                {"id": "urn:example:text", "value": "be careful"},
+                {"id": "urn:example:tag", "value": "a"},
+                {"id": "urn:example:tag", "value": "b"},
+                {"id": "urn:example:count", "value": 3}]}]}}),
+        vec![],
+    ));
+    match pep.decide(&alice(), &read_42()) {
+        Decision::Permit { obligations, advice } => {
+            assert!(obligations.is_empty());
+            assert_eq!(advice.len(), 1);
+            assert_eq!(advice[0].id, "urn:example:advice:banner");
+            assert_eq!(advice[0].kind, "urn:example:advice:banner");
+            assert_eq!(advice[0].properties["urn:example:text"], "be careful");
+            assert_eq!(advice[0].properties["urn:example:tag"], json!(["a", "b"]));
+            assert_eq!(advice[0].properties["urn:example:count"], "3");
+        }
+        other => panic!("{other:?}"),
+    }
+}

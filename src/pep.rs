@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 
 use crate::config::{Mode, PepConfig};
 use crate::credential::{Audience, Credential};
-use crate::decision::{evaluation_body, obligation_from, Access, Decision, Subject};
+use crate::decision::{advice_from, evaluation_body, obligation_from, Access, Decision, Subject};
 use crate::error::PepError;
 use crate::http::{Body, Client};
 use crate::key::random_id;
@@ -209,6 +209,11 @@ pub(crate) struct Inner {
     /// service refuses an evaluation naming a property its catalogue does
     /// not declare, so only these of a subject's claims are sent.
     subject_roots: RwLock<(String, Arc<HashSet<String>>)>,
+    /// The PEP's directory entry, as the registration answer names it
+    /// (`identity`). The service writes the caller fact
+    /// `urn:sts:xacml:authzen:caller` as this DN, so `local` writes it too;
+    /// until a registration names one, the PEP's name.
+    identity: RwLock<String>,
     #[cfg(feature = "local")]
     held: RwLock<Option<Arc<crate::local::Held>>>,
     #[cfg(not(feature = "local"))]
@@ -243,6 +248,7 @@ impl Pep {
                 signal: Condvar::new(),
                 permits: Mutex::new(HashMap::new()),
                 subject_roots: RwLock::new((String::new(), Arc::new(HashSet::new()))),
+                identity: RwLock::new(String::new()),
                 held: RwLock::new(None),
                 config,
             }),
@@ -433,6 +439,15 @@ impl Inner {
         self.config.base()
     }
 
+    /// The caller fact `local` writes: the DN the registration answered,
+    /// which is what the service writes for this PEP's evaluations, else the
+    /// PEP's name.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    fn caller(&self) -> String {
+        let dn = self.identity.read().unwrap_or_else(|e| e.into_inner());
+        if dn.is_empty() { self.config.name.clone() } else { dn.clone() }
+    }
+
     /// The catalogue's token and how many subject properties it declares:
     /// the held set's in `local`, the one pulled for its claims in `central`.
     fn catalogue_held(&self) -> (String, usize) {
@@ -470,6 +485,9 @@ impl Inner {
         let url = format!("{}/xacml/pep/register", self.base());
         match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&self.identity()))) {
             Ok(answer) if answer.status == 200 || answer.status == 201 => {
+                if let Some(dn) = answer.json().and_then(|j| j["identity"].as_str().map(str::to_string)).filter(|dn| !dn.is_empty()) {
+                    *self.identity.write().unwrap_or_else(|e| e.into_inner()) = dn;
+                }
                 self.counters.registrations.fetch_add(1, Ordering::Relaxed);
                 self.registered.store(true, Ordering::Relaxed);
                 self.note("register", "");
@@ -679,7 +697,9 @@ impl Inner {
         let decision = match (answer.status, json.get("decision").and_then(Value::as_bool)) {
             (200, Some(true)) => Decision::Permit {
                 obligations: json["context"]["obligations"].as_array().map(|list| list.iter().filter_map(obligation_from).collect()).unwrap_or_default(),
-                advice: Vec::new(),
+                // Sent only while the realm's `authzen.returnReasons` is on;
+                // local mode hands the engine's advice whatever it says.
+                advice: json["context"]["advice"].as_array().map(|list| list.iter().filter_map(advice_from).collect()).unwrap_or_default(),
             },
             (200, Some(false)) => {
                 if json["context"]["undischargeable_obligations"].as_array().is_some_and(|l| !l.is_empty()) {
@@ -718,7 +738,7 @@ impl Inner {
         let body = evaluation_body(&declared_only(subject, &roots), access, &self.config.application, &self.config.supported_obligations);
         let trusted = crate::authzen::Trusted {
             realm: self.config.realm(),
-            caller: self.config.name.clone(),
+            caller: self.caller(),
             application: self.config.application.clone(),
             fga: held.catalogue.fga_applications.contains(&self.config.application),
         };

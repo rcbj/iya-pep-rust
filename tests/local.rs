@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use iya_pep::{Access, Decision, EventStream, Mode, Pep, PepConfig, Subject};
 use serde_json::{json, Map, Value};
-use support::{key_file, Stub, APP, NAME};
+use support::{key_file, Stub, APP, IDENTITY, NAME};
 
 const STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 const ACTION: &str = "urn:oasis:names:tc:xacml:3.0:attribute-category:action";
@@ -296,4 +296,41 @@ fn the_status_reports_times_counters_and_what_is_held() {
     assert_eq!(s.pdp_url, stub.base);
     pep.stop();
     assert_eq!(pep.status().until_next_pull, None, "nothing is scheduled once stopped");
+}
+
+/// `who` is permitted only when the trusted caller fact names `caller`.
+fn caller_policy(caller: &str) -> Value {
+    let environment = "urn:oasis:names:tc:xacml:3.0:attribute-category:environment";
+    let document = format!(
+        r#"<Policy xmlns="urn:oasis:names:tc:xacml:3.0:core:schema:wd-17" PolicyId="caller" Version="1.0" RuleCombiningAlgId="urn:oasis:names:tc:xacml:3.0:rule-combining-algorithm:deny-unless-permit"><Target/><Rule RuleId="who" Effect="Permit">{}<Condition><Apply FunctionId="urn:oasis:names:tc:xacml:1.0:function:string-is-in"><AttributeValue DataType="{STRING}">{caller}</AttributeValue><AttributeDesignator Category="{environment}" AttributeId="urn:sts:xacml:authzen:caller" DataType="{STRING}" MustBePresent="false"/></Apply></Condition></Rule></Policy>"#,
+        action_is("who"),
+    );
+    json!({"name": "caller", "policyId": "caller", "kind": "Policy", "version": "1.0",
+           "combiningAlgId": "urn:oasis:names:tc:xacml:3.0:rule-combining-algorithm:deny-unless-permit",
+           "isRoot": true, "description": "", "document": document})
+}
+
+#[test]
+fn the_caller_fact_is_the_dn_the_registration_named() {
+    // The service writes urn:sts:xacml:authzen:caller as the PEP's entry
+    // DN, so a policy reading it must see the same value in local mode.
+    let stub = stub();
+    stub.script.lock().unwrap().policies = vec![caller_policy(IDENTITY)];
+    let unregistered = Pep::new(config(&stub, "l-caller-name")).unwrap();
+    unregistered.pull_now().unwrap();
+    assert!(!unregistered.decide(&alice(None), &on("who")).is_permit(), "before a registration the caller is the name, not the DN");
+
+    let pep = Pep::new(config(&stub, "l-caller-dn")).unwrap();
+    pep.start().unwrap();
+    assert!(pep.status().registered);
+    assert!(pep.decide(&alice(None), &on("who")).is_permit(), "after it, the DN the answer named");
+    pep.stop();
+
+    {
+        let mut s = stub.script.lock().unwrap();
+        s.policies = vec![caller_policy(NAME)];
+        s.policy_token = "p-name".into();
+    }
+    unregistered.pull_now().unwrap();
+    assert!(unregistered.decide(&alice(None), &on("who")).is_permit());
 }

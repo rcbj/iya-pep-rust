@@ -111,6 +111,31 @@ pub fn obligation_from(value: &Value) -> Option<Obligation> {
     })
 }
 
+/// An advice as the service's AuthZEN `context.advice` carries it (`id`,
+/// `attributes: [{id, value}]`), read into the shape `local` hands: the
+/// kind is the id, each attribute a property named by its id, its value the
+/// lexical form, and a repeated id an array, in order.
+pub fn advice_from(value: &Value) -> Option<Obligation> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let mut properties = serde_json::Map::new();
+    for attribute in value.get("attributes").and_then(Value::as_array).into_iter().flatten() {
+        let Some(name) = attribute.get("id").and_then(Value::as_str) else { continue };
+        let text = match attribute.get("value") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Null) | None => continue,
+            Some(other) => other.to_string(),
+        };
+        match properties.get_mut(name) {
+            Some(Value::Array(values)) => values.push(Value::String(text)),
+            Some(existing) => *existing = Value::Array(vec![existing.clone(), Value::String(text)]),
+            None => {
+                properties.insert(name.to_string(), Value::String(text));
+            }
+        }
+    }
+    Some(Obligation { id: id.clone(), kind: id, properties })
+}
+
 /// `central`: pulls the catalogue and answers its token and the subject
 /// properties it declares, or `None` on `304`.
 pub(crate) fn pull_subject_roots(credential: &crate::credential::Credential, base: &str, token: &str) -> Result<Option<(String, std::collections::HashSet<String>)>, crate::error::PepError> {

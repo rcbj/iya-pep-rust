@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 
 pub const REALM: &str = "r1";
 pub const NAME: &str = "pep-orders";
+/// The DN the stub's registration answer names as the PEP's entry.
+pub const IDENTITY: &str = "cn=pep-orders,ou=users,dc=example,dc=com";
 pub const APP: &str = "orders";
 
 /// One request the stub was sent.
@@ -209,7 +211,7 @@ fn answer(base: &str, r: &Seen, script: &mut Script, tokens: &mut u32, nonce_ask
             h.push(("WWW-Authenticate".into(), "DPoP error=\"invalid_token\"".into()));
             (s, b, h)
         }
-        ("POST", "/xacml/pep/register") => json_answer(script.register_status, json!({"registered": true, "name": NAME, "created": true})),
+        ("POST", "/xacml/pep/register") => json_answer(script.register_status, json!({"registered": true, "name": NAME, "created": true, "identity": IDENTITY})),
         ("POST", "/xacml/pep/heartbeat") => {
             json_answer(script.heartbeat_status, json!({"acknowledged": true, "name": NAME, "syncToken": script.policy_token, "current": script.heartbeat_current, "action": ""}))
         }
