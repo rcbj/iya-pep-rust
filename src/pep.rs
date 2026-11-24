@@ -101,6 +101,70 @@ pub struct Status {
     /// The current problems, one per area (registration, pull, heartbeat,
     /// records, key), joined; empty when there are none.
     pub last_error: String,
+
+    // ---- Where the PEP is talking to, and how.
+    /// The service's base URL, the realm prefix included.
+    pub pdp_url: String,
+    pub protocol_version: u32,
+    /// What the host's signal stream carries, as the heartbeat reports it.
+    pub event_stream: EventStream,
+
+    // ---- Times. `None` until the thing has happened (or while the
+    // background work is not running, for the `until_` ones).
+    /// Since `start`.
+    pub uptime: Option<Duration>,
+    /// Since what the PEP holds last changed: a new policy set or catalogue
+    /// (`local`), a new catalogue (`central`).
+    pub since_policy_update: Option<Duration>,
+    /// Since the last pull that succeeded, changed or `304`.
+    pub since_last_pull: Option<Duration>,
+    /// Until the next scheduled pull. An event, or a heartbeat saying the
+    /// PEP is stale, pulls sooner.
+    pub until_next_pull: Option<Duration>,
+    pub since_last_heartbeat: Option<Duration>,
+    pub until_next_heartbeat: Option<Duration>,
+    /// Since the last `pep-policies-changed` event acted on.
+    pub since_last_event: Option<Duration>,
+
+    // ---- What is held.
+    /// The catalogue's sync token.
+    pub catalogue_token: String,
+    /// Subject properties the catalogue declares (the claims that are sent).
+    pub catalogue_subject_properties: usize,
+
+    // ---- Counters since `Pep::new`.
+    pub pulls: u64,
+    /// Pulls that brought something new (the rest were `304`).
+    pub pulls_changed: u64,
+    pub pull_failures: u64,
+    pub heartbeats: u64,
+    pub heartbeat_failures: u64,
+    pub registrations: u64,
+    pub events_received: u64,
+    /// Events naming another PEP.
+    pub events_ignored: u64,
+    pub records_shipped: u64,
+    /// Records dropped because the queue was full.
+    pub records_dropped: u64,
+    /// `central`: Permits held in the cache now, and decisions it answered.
+    pub permit_cache_entries: usize,
+    pub permit_cache_hits: u64,
+    /// The decisions' mean and slowest time, in microseconds (`central`
+    /// includes the round trip to the service; `local` the PIP, if asked).
+    pub mean_decision_micros: u64,
+    pub max_decision_micros: u64,
+}
+
+/// When things happened and are due, for `Status`.
+#[derive(Default)]
+struct Timing {
+    started: Option<Instant>,
+    last_change: Option<Instant>,
+    last_pull: Option<Instant>,
+    next_pull: Option<Instant>,
+    last_heartbeat: Option<Instant>,
+    next_heartbeat: Option<Instant>,
+    last_event: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -110,6 +174,17 @@ struct Counters {
     refused: AtomicU64,
     unavailable: AtomicU64,
     undischargeable: AtomicU64,
+    pulls: AtomicU64,
+    pulls_changed: AtomicU64,
+    pull_failures: AtomicU64,
+    heartbeats: AtomicU64,
+    heartbeat_failures: AtomicU64,
+    registrations: AtomicU64,
+    events_received: AtomicU64,
+    events_ignored: AtomicU64,
+    permit_cache_hits: AtomicU64,
+    decision_micros_total: AtomicU64,
+    decision_micros_max: AtomicU64,
 }
 
 #[derive(Default)]
@@ -122,6 +197,7 @@ pub(crate) struct Inner {
     config: PepConfig,
     credential: Credential,
     registered: AtomicBool,
+    timing: Mutex<Timing>,
     counters: Counters,
     records: Records,
     problems: Mutex<std::collections::BTreeMap<&'static str, String>>,
@@ -159,6 +235,7 @@ impl Pep {
                 records: Records::new(instance),
                 credential,
                 registered: AtomicBool::new(false),
+                timing: Mutex::new(Timing::default()),
                 counters: Counters::default(),
                 problems: Mutex::new(std::collections::BTreeMap::new()),
                 event_stream: Mutex::new(event_stream),
@@ -202,6 +279,7 @@ impl Pep {
             return Ok(());
         }
         self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).stop = false;
+        self.inner.timing.lock().unwrap_or_else(|e| e.into_inner()).started = Some(Instant::now());
         self.inner.register();
         self.inner.pull();
         let inner = Arc::clone(&self.inner);
@@ -227,11 +305,15 @@ impl Pep {
     /// Decides one access. Never fails: what can't be decided is
     /// `Unavailable`.
     pub fn decide(&self, subject: &Subject, access: &Access) -> Decision {
+        let began = Instant::now();
         let decision = match self.inner.config.mode {
             Mode::Central => self.inner.decide_central(subject, access),
             Mode::Local => self.inner.decide_local(subject, access),
         };
         let c = &self.inner.counters;
+        let micros = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
+        c.decision_micros_total.fetch_add(micros, Ordering::Relaxed);
+        c.decision_micros_max.fetch_max(micros, Ordering::Relaxed);
         c.decisions.fetch_add(1, Ordering::Relaxed);
         match &decision {
             Decision::Permit { .. } => c.allowed.fetch_add(1, Ordering::Relaxed),
@@ -251,9 +333,12 @@ impl Pep {
     pub fn on_policy_event(&self, payload: &Value) -> bool {
         if let Some(pep) = payload.get("pep").and_then(Value::as_str) {
             if pep != self.inner.config.name {
+                self.inner.counters.events_ignored.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         }
+        self.inner.counters.events_received.fetch_add(1, Ordering::Relaxed);
+        self.inner.timing.lock().unwrap_or_else(|e| e.into_inner()).last_event = Some(Instant::now());
         self.inner.permits.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.inner.wake.lock().unwrap_or_else(|e| e.into_inner()).pull = true;
         self.inner.signal.notify_all();
@@ -269,7 +354,7 @@ impl Pep {
     /// Pulls now and waits for it (`local`). For a host that wants the
     /// policy before it serves its first request.
     pub fn pull_now(&self) -> Result<(), PepError> {
-        self.inner.pull_result()
+        self.inner.pull_counted().map(|_| ())
     }
 
     pub fn status(&self) -> Status {
@@ -282,12 +367,20 @@ impl Pep {
         };
         #[cfg(not(feature = "local"))]
         let (holds_policy, policy_count, sync_token) = (false, 0, String::new());
+        let (catalogue_token, catalogue_subject_properties) = inner.catalogue_held();
+        let running = self.worker.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let t = inner.timing.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+        let until = |at: Option<Instant>| at.map(|at| at.saturating_duration_since(now));
+        let (shipped, dropped) = inner.records.counts();
+        let decisions = c.decisions.load(Ordering::Relaxed);
         Status {
             name: inner.config.name.clone(),
             mode: inner.config.mode,
             application: inner.config.application.clone(),
             registered: inner.registered.load(Ordering::Relaxed),
-            running: self.worker.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            running,
             holds_policy,
             policy_count,
             sync_token,
@@ -299,6 +392,32 @@ impl Pep {
             records_queued: inner.records.queued(),
             key_thumbprint: inner.credential.thumbprint(),
             last_error: inner.problems.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect::<Vec<_>>().join("; "),
+            pdp_url: inner.config.base().to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            event_stream: *inner.event_stream.lock().unwrap_or_else(|e| e.into_inner()),
+            uptime: since(t.started),
+            since_policy_update: since(t.last_change),
+            since_last_pull: since(t.last_pull),
+            until_next_pull: if running { until(t.next_pull) } else { None },
+            since_last_heartbeat: since(t.last_heartbeat),
+            until_next_heartbeat: if running { until(t.next_heartbeat) } else { None },
+            since_last_event: since(t.last_event),
+            catalogue_token,
+            catalogue_subject_properties,
+            pulls: c.pulls.load(Ordering::Relaxed),
+            pulls_changed: c.pulls_changed.load(Ordering::Relaxed),
+            pull_failures: c.pull_failures.load(Ordering::Relaxed),
+            heartbeats: c.heartbeats.load(Ordering::Relaxed),
+            heartbeat_failures: c.heartbeat_failures.load(Ordering::Relaxed),
+            registrations: c.registrations.load(Ordering::Relaxed),
+            events_received: c.events_received.load(Ordering::Relaxed),
+            events_ignored: c.events_ignored.load(Ordering::Relaxed),
+            records_shipped: shipped,
+            records_dropped: dropped,
+            permit_cache_entries: inner.permits.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            permit_cache_hits: c.permit_cache_hits.load(Ordering::Relaxed),
+            mean_decision_micros: c.decision_micros_total.load(Ordering::Relaxed).checked_div(decisions).unwrap_or(0),
+            max_decision_micros: c.decision_micros_max.load(Ordering::Relaxed),
         }
     }
 }
@@ -312,6 +431,18 @@ impl Drop for Pep {
 impl Inner {
     fn base(&self) -> &str {
         self.config.base()
+    }
+
+    /// The catalogue's token and how many subject properties it declares:
+    /// the held set's in `local`, the one pulled for its claims in `central`.
+    fn catalogue_held(&self) -> (String, usize) {
+        #[cfg(feature = "local")]
+        if let Some(h) = self.held.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let roots: HashSet<String> = h.catalogue.rows.iter().filter(|r| r.object == "subject").map(|r| root_of(&r.property)).collect();
+            return (h.catalogue_token.clone(), roots.len());
+        }
+        let roots = self.subject_roots.read().unwrap_or_else(|e| e.into_inner());
+        (roots.0.clone(), roots.1.len())
     }
 
     /// Records the problem of one area, or clears it with an empty one.
@@ -339,6 +470,7 @@ impl Inner {
         let url = format!("{}/xacml/pep/register", self.base());
         match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&self.identity()))) {
             Ok(answer) if answer.status == 200 || answer.status == 201 => {
+                self.counters.registrations.fetch_add(1, Ordering::Relaxed);
                 self.registered.store(true, Ordering::Relaxed);
                 self.note("register", "");
             }
@@ -371,7 +503,14 @@ impl Inner {
         body["refused"] = json!(c.refused.load(Ordering::Relaxed) + c.unavailable.load(Ordering::Relaxed));
         body["undischargeable"] = json!(c.undischargeable.load(Ordering::Relaxed));
         body["policyEvents"] = json!(self.event_stream.lock().unwrap_or_else(|e| e.into_inner()).as_str());
-        match self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&body))) {
+        let answer = self.credential.call(Audience::Pep, "POST", &url, "application/json", &[], Some(&Body::Json(&body)));
+        if matches!(&answer, Ok(a) if a.status == 200) {
+            self.counters.heartbeats.fetch_add(1, Ordering::Relaxed);
+            self.timing.lock().unwrap_or_else(|e| e.into_inner()).last_heartbeat = Some(Instant::now());
+        } else {
+            self.counters.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        match answer {
             Ok(answer) if answer.status == 200 => {
                 self.note("heartbeat", "");
                 answer.json().is_some_and(|j| j["current"] == json!(false))
@@ -393,26 +532,51 @@ impl Inner {
 
     /// `local`: the policies and the catalogue. `central`: the catalogue
     /// alone, for the subject properties it declares.
-    fn pull_result(&self) -> Result<(), PepError> {
+    /// Returns whether anything new is held.
+    fn pull_result(&self) -> Result<bool, PepError> {
         #[cfg(feature = "local")]
         if self.config.mode == Mode::Local {
             let current = self.held.read().unwrap_or_else(|e| e.into_inner()).clone();
             let (_, fresh) = crate::local::pull(&self.credential, self.base(), &self.config.name, current.as_ref())?;
+            let changed = fresh.is_some();
             if let Some(fresh) = fresh {
                 *self.held.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(fresh));
             }
-            return Ok(());
+            return Ok(changed);
         }
         let token = self.subject_roots.read().unwrap_or_else(|e| e.into_inner()).0.clone();
-        if let Some(fresh) = crate::decision::pull_subject_roots(&self.credential, self.base(), &token)? {
+        let fresh = crate::decision::pull_subject_roots(&self.credential, self.base(), &token)?;
+        let changed = fresh.is_some();
+        if let Some(fresh) = fresh {
             *self.subject_roots.write().unwrap_or_else(|e| e.into_inner()) = (fresh.0, Arc::new(fresh.1));
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// `pull_result`, counted and timed for `Status`.
+    fn pull_counted(&self) -> Result<bool, PepError> {
+        let result = self.pull_result();
+        let now = Instant::now();
+        match &result {
+            Ok(changed) => {
+                self.counters.pulls.fetch_add(1, Ordering::Relaxed);
+                let mut t = self.timing.lock().unwrap_or_else(|e| e.into_inner());
+                t.last_pull = Some(now);
+                if *changed {
+                    self.counters.pulls_changed.fetch_add(1, Ordering::Relaxed);
+                    t.last_change = Some(now);
+                }
+            }
+            Err(_) => {
+                self.counters.pull_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     fn pull(&self) {
-        match self.pull_result() {
-            Ok(()) => self.note("pull", ""),
+        match self.pull_counted() {
+            Ok(_) => self.note("pull", ""),
             Err(err) => self.note("pull", &format!("the pull: {err}")),
         }
     }
@@ -468,6 +632,11 @@ impl Inner {
                 next_records = now + RECORDS_INTERVAL;
                 self.ship_records();
             }
+            {
+                let mut t = self.timing.lock().unwrap_or_else(|e| e.into_inner());
+                t.next_pull = Some(next_pull);
+                t.next_heartbeat = Some(next_heartbeat);
+            }
         }
         self.ship_records();
     }
@@ -491,7 +660,10 @@ impl Inner {
         if !cache_for.is_zero() {
             let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
             match permits.get(&cache_key) {
-                Some((at, decision)) if at.elapsed() < cache_for => return decision.clone(),
+                Some((at, decision)) if at.elapsed() < cache_for => {
+                    self.counters.permit_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return decision.clone();
+                }
                 Some(_) => {
                     permits.remove(&cache_key);
                 }

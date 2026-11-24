@@ -186,6 +186,8 @@ fn the_permit_cache_is_short_and_cleared_by_the_event() {
     assert!(pep.decide(&alice(), &read_42()).is_permit());
     assert!(pep.decide(&alice(), &read_42()).is_permit());
     assert_eq!(stub.count("/access/v1/evaluation"), 1, "the second came from the cache");
+    assert_eq!(pep.status().permit_cache_hits, 1);
+    assert_eq!(pep.status().permit_cache_entries, 1);
     assert!(pep.decide(&alice(), &Access::new("write", "order", "42")).is_permit());
     assert_eq!(stub.count("/access/v1/evaluation"), 2, "another action is another question");
 

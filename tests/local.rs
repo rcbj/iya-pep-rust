@@ -259,3 +259,41 @@ fn the_heartbeat_reports_what_is_held_and_the_stream() {
     assert!(stub.wait(Duration::from_secs(5), |s| s.seen("/xacml/pep/heartbeat").last().unwrap().json()["policyEvents"] == "excluded"));
     pep.stop();
 }
+
+#[test]
+fn the_status_reports_times_counters_and_what_is_held() {
+    let stub = stub();
+    let mut c = config(&stub, "l-status");
+    c.signals = true;
+    c.fallback_poll_ms = 60_000;
+    let pep = Pep::new(c).unwrap();
+    let before = pep.status();
+    assert_eq!((before.uptime, before.since_last_pull, before.until_next_pull), (None, None, None), "nothing has happened yet");
+    pep.start().unwrap();
+    assert!(stub.wait(Duration::from_secs(5), |_| pep.status().until_next_pull.is_some() && pep.status().since_last_heartbeat.is_some()));
+    pep.decide(&alice(None), &on("read"));
+    pep.decide(&alice(None), &on("write"));
+    pep.on_policy_event(&json!({"pep": "another-pep"}));
+    pep.on_policy_event(&json!({"pep": NAME}));
+    assert!(stub.wait(Duration::from_secs(5), |_| pep.status().pulls >= 2), "the event pulled");
+    let s = pep.status();
+    assert!(s.uptime.is_some());
+    assert_eq!(s.policy_count, 1);
+    assert_eq!((s.decisions, s.allowed, s.refused), (2, 1, 1));
+    assert_eq!(s.pulls_changed, 1, "the first pull brought the set, the second was 304");
+    assert_eq!(s.pull_failures, 0);
+    assert!(s.since_policy_update.is_some() && s.since_last_pull.unwrap() <= s.since_policy_update.unwrap());
+    let next = s.until_next_pull.unwrap();
+    assert!(next <= Duration::from_secs(60) && next > Duration::from_secs(50), "the fallback poll is about a minute away: {next:?}");
+    assert!(s.until_next_heartbeat.unwrap() <= Duration::from_secs(1));
+    assert!(s.heartbeats >= 1 && s.registrations == 1);
+    assert_eq!((s.events_received, s.events_ignored), (1, 1));
+    assert!(s.since_last_event.is_some());
+    assert_eq!(s.catalogue_token, "c1");
+    assert_eq!(s.catalogue_subject_properties, 1, "acr");
+    assert_eq!(s.event_stream, EventStream::Requested);
+    assert!(s.max_decision_micros >= s.mean_decision_micros && s.mean_decision_micros > 0);
+    assert_eq!(s.pdp_url, stub.base);
+    pep.stop();
+    assert_eq!(pep.status().until_next_pull, None, "nothing is scheduled once stopped");
+}
