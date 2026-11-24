@@ -169,7 +169,7 @@ fn run_obligations(table: &Value, failures: &mut Vec<String>) -> usize {
                     .collect()
             })
             .unwrap_or_default();
-        let response = Response { decision, obligations, advice: Vec::new() };
+        let response = Response { decision, obligations, advice: Vec::new(), status_code: iya_pep::engine::STATUS_OK.into() };
         let supported: Option<Vec<String>> = serde_json::from_value(case["supported"].clone()).expect("supported");
         let profile = case["profile"].as_bool().unwrap_or(false);
         let got = outcome(&response, supported.as_deref(), profile);
@@ -228,6 +228,7 @@ fn agrees_with_the_shared_authzen_table() {
 fn hands_a_step_up_in_the_services_shape() {
     let response = Response {
         decision: Decision::Permit,
+        status_code: iya_pep::engine::STATUS_OK.into(),
         obligations: vec![Obligation {
             id: "urn:sts:xacml:authzen:obligation:step-up".into(),
             assignments: vec![

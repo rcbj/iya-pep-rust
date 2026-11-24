@@ -4,4 +4,4 @@
 FROM rust:1-bookworm AS test
 WORKDIR /src
 COPY . .
-RUN cargo test --all-features && cargo test --no-default-features && cargo build --lib
+RUN rustup component add clippy && cargo test --all-features && cargo test --no-default-features && cargo clippy --all-features --all-targets -- -D warnings && cargo clippy --no-default-features --all-targets -- -D warnings && cargo build --lib

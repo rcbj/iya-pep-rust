@@ -203,6 +203,8 @@ const MAX_NESTING: usize = 8;
 const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 const LOG_OBLIGATION: &str = "urn:sts:xacml:obligation:log";
+/// The status of an Indeterminate that is an ordinary deny, not a fault.
+const MISSING_ATTRIBUTE: &str = "urn:oasis:names:tc:xacml:1.0:status:missing-attribute";
 const OBLIGATION_PREFIX: &str = "urn:sts:xacml:authzen:obligation:";
 
 /// The Obligations Profile's registered types: name, the properties it may
@@ -1120,7 +1122,10 @@ pub struct Outcome {
 /// processing error is never reported as a denial. A caller that knows the
 /// status uses [`outcome_with_fault`].
 pub fn outcome(response: &engine::Response, supported: Option<&[String]>, profile: bool) -> Outcome {
-    outcome_with_fault(response, response.decision == engine::Decision::Indeterminate, supported, profile)
+    // An Indeterminate over a missing attribute is an ordinary false, as at
+    // the service; one over a processing or syntax error is a fault.
+    let fault = response.decision == engine::Decision::Indeterminate && response.status_code != MISSING_ATTRIBUTE;
+    outcome_with_fault(response, fault, supported, profile)
 }
 
 /// [`outcome`], with the caller saying whether the answer is a fault: an

@@ -62,6 +62,9 @@ pub fn claims(jws: &str) -> Value {
     part(jws, 1)
 }
 
+/// A scripted answer: the status, the body and extra headers.
+pub type Scripted = (u16, Value, Vec<(String, String)>);
+
 /// What the stub answers; tests change it while the PEP runs.
 pub struct Script {
     /// The token endpoint asks for a nonce on the first grant.
@@ -70,7 +73,7 @@ pub struct Script {
     pub token_refused: bool,
     /// Answers for `POST /access/v1/evaluation`, taken in order; when empty,
     /// `evaluation_default`.
-    pub evaluations: VecDeque<(u16, Value, Vec<(String, String)>)>,
+    pub evaluations: VecDeque<Scripted>,
     pub evaluation_default: (u16, Value),
     /// The heartbeat's status and `current`.
     pub heartbeat_status: u16,
