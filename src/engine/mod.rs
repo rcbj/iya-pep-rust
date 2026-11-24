@@ -18,7 +18,17 @@
 //! THIS MODULE'S PUBLIC TYPES ARE THE CONTRACT with the rest of the crate.
 //! Change them only together with `src/local.rs`.
 
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+mod compile;
+mod eval;
+mod function;
+mod index;
+mod value;
+mod xsd_regex;
+
+#[cfg(test)]
+mod tests;
 
 /// The canonical XACML 3.0 category of the access subject.
 pub const ACCESS_SUBJECT: &str = "urn:oasis:names:tc:xacml:1.0:subject-category:access-subject";
@@ -28,6 +38,8 @@ pub const RESOURCE: &str = "urn:oasis:names:tc:xacml:3.0:attribute-category:reso
 pub const ACTION: &str = "urn:oasis:names:tc:xacml:3.0:attribute-category:action";
 /// The environment category.
 pub const ENVIRONMENT: &str = "urn:oasis:names:tc:xacml:3.0:attribute-category:environment";
+/// The status code of every decision that is not Indeterminate.
+pub const STATUS_OK: &str = "urn:oasis:names:tc:xacml:1.0:status:ok";
 /// `http://www.w3.org/2001/XMLSchema#string`.
 pub const STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 
@@ -142,6 +154,11 @@ pub struct Response {
     pub decision: Decision,
     pub obligations: Vec<Obligation>,
     pub advice: Vec<Obligation>,
+    /// The XACML status code of the decision: `urn:oasis:names:tc:xacml:1.0:status:ok`,
+    /// or for an Indeterminate the one that caused it (`...:status:missing-attribute`,
+    /// `...:status:processing-error`, `...:status:syntax-error`), as the reference
+    /// engine reports it.
+    pub status_code: String,
 }
 
 /// Why a set of policies could not be compiled. The PEP keeps the set it
@@ -179,35 +196,40 @@ impl Resolver for NoResolver {
 
 /// A compiled set of policies: the root and everything it references.
 pub struct Policies {
-    _private: (),
+    tree: compile::Tree,
+    documents: usize,
 }
 
 impl Policies {
     /// Parses and compiles a pulled set. Exactly one row is the root; a
     /// reference resolves to another row of the set by `policyId`.
     pub fn compile(rows: &[PolicyDocument]) -> Result<Policies, CompileError> {
-        let _ = rows;
-        Err(CompileError { policy_id: String::new(), message: "the engine is not implemented yet".into() })
+        Ok(Policies { tree: compile::compile(rows)?, documents: rows.len() })
     }
 
     /// Evaluates the root against `request`, with `now` as the instant
     /// `current-time`, `current-date` and `current-dateTime` come from.
     pub fn evaluate(&self, request: &Request, now: SystemTime, resolver: &dyn Resolver) -> Response {
-        let _ = (request, now, resolver);
-        Response { decision: Decision::Indeterminate, obligations: Vec::new(), advice: Vec::new() }
+        let seconds = match now.duration_since(UNIX_EPOCH) {
+            Ok(after) => after.as_secs().min(i64::MAX as u64) as i64,
+            Err(before) => -(before.duration().as_secs().min(i64::MAX as u64) as i64),
+        };
+        eval::evaluate(&self.tree, request, seconds, resolver)
     }
 
     /// Every designator in `category` the compiled set could ask for, found
     /// statically (targets, conditions, variables, obligation and advice
     /// expressions, referenced policies). Over-fetches; never misses one.
     pub fn designators(&self, category: &str) -> Vec<Designator> {
-        let _ = category;
-        Vec::new()
+        let mut found: Vec<Designator> =
+            self.tree.designators.iter().filter(|d| d.category == category).cloned().collect();
+        found.sort();
+        found
     }
 
     /// How many Policy and PolicySet documents were compiled.
     pub fn len(&self) -> usize {
-        0
+        self.documents
     }
 
     pub fn is_empty(&self) -> bool {
