@@ -133,6 +133,14 @@ pub fn jwk_thumbprint(jwk: &Value) -> Option<String> {
     Some(b64url(&Sha256::digest(canonical.as_bytes())))
 }
 
+/// The RFC 7638 thumbprint of a PEM private key's public half (EC P-256 or
+/// RSA ≥ 2048), for a host library comparing a key file of its own (a TLS
+/// client key, a signing key) with the PEP's. `None` for a key this crate
+/// can't read.
+pub fn pem_thumbprint(pem: &str) -> Option<String> {
+    SigningKey::from_pem(pem).ok().map(|k| k.thumbprint().to_string())
+}
+
 /// 128 random bits as hex, for a `jti`.
 pub fn random_id() -> String {
     use rand::RngCore;
@@ -163,6 +171,13 @@ pub(crate) mod tests {
         let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
         assert_eq!(header["alg"], "ES256");
         assert_eq!(jwk_thumbprint(key.jwk()).as_deref(), Some(key.thumbprint()));
+    }
+
+    #[test]
+    fn a_pem_thumbprint_is_the_keys() {
+        let key = SigningKey::from_pem(&ec_pem()).unwrap();
+        assert_eq!(pem_thumbprint(&ec_pem()).as_deref(), Some(key.thumbprint()));
+        assert_eq!(pem_thumbprint("garbage"), None);
     }
 
     #[test]

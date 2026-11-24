@@ -41,5 +41,5 @@ pub mod records;
 pub use config::{Mode, PepConfig};
 pub use decision::{Access, Decision, Obligation, Subject};
 pub use error::PepError;
-pub use key::jwk_thumbprint;
+pub use key::{jwk_thumbprint, pem_thumbprint};
 pub use pep::{EventStream, Pep, Status, POLICIES_CHANGED_EVENT, PROTOCOL_VERSION};
