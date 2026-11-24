@@ -116,7 +116,6 @@ struct Wake {
 pub(crate) struct Inner {
     config: PepConfig,
     credential: Credential,
-    instance: String,
     registered: AtomicBool,
     counters: Counters,
     records: Records,
@@ -148,8 +147,7 @@ impl Pep {
         let event_stream = if config.signals { EventStream::Requested } else { EventStream::None };
         Ok(Self {
             inner: Arc::new(Inner {
-                records: Records::new(instance.clone()),
-                instance,
+                records: Records::new(instance),
                 credential,
                 registered: AtomicBool::new(false),
                 counters: Counters::default(),
@@ -174,6 +172,14 @@ impl Pep {
     /// configuration where it equals one of its own keys' (D1).
     pub fn key_thumbprint(&self) -> String {
         self.inner.credential.thumbprint()
+    }
+
+    /// Reads the key file again now, rather than at the next periodic
+    /// check. A changed key drops every token, because each is bound to the
+    /// key that asked for it. Returns whether the key changed; a file that
+    /// no longer holds a usable key keeps the one held and is an error.
+    pub fn reload_key(&self) -> Result<bool, PepError> {
+        self.inner.credential.reload_key()
     }
 
     /// Starts the background work. The first registration and (in `local`)
