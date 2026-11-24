@@ -47,6 +47,10 @@ const KEY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// The background loop never sleeps longer than this, so `stop` and an
 /// event are prompt even if a notification is missed.
 const TICK: Duration = Duration::from_secs(1);
+/// A refused or failed registration is tried again after this, doubling up
+/// to the heartbeat interval, so a PEP the service refuses (no binding, an
+/// unsupported protocol version) doesn't knock every second.
+const REGISTER_RETRY_FIRST: Duration = Duration::from_secs(2);
 
 /// Whether the host's signal stream can carry `pep-policies-changed`,
 /// reported on the heartbeat (D4) so the console shows a `local` PEP that
@@ -418,6 +422,9 @@ impl Inner {
         let mut next_heartbeat = now;
         let mut next_records = now + RECORDS_INTERVAL;
         let mut next_key = now + KEY_CHECK_INTERVAL;
+        let mut next_register = now;
+        let mut register_retry = REGISTER_RETRY_FIRST;
+        let register_retry_max = Duration::from_millis(self.config.heartbeat_interval_ms).max(REGISTER_RETRY_FIRST);
         let poll = Duration::from_millis(if self.config.signals { self.config.fallback_poll_ms } else { self.config.poll_interval_ms });
         let mut next_pull = now + poll;
         loop {
@@ -439,8 +446,14 @@ impl Inner {
                     Err(err) => self.note("key", &format!("the assertion key: {err}")),
                 }
             }
-            if !self.registered.load(Ordering::Relaxed) {
+            if !self.registered.load(Ordering::Relaxed) && now >= next_register {
                 self.register();
+                if self.registered.load(Ordering::Relaxed) {
+                    register_retry = REGISTER_RETRY_FIRST;
+                } else {
+                    next_register = now + register_retry;
+                    register_retry = (register_retry * 2).min(register_retry_max);
+                }
             }
             let mut pull_due = pull_asked || now >= next_pull;
             if now >= next_heartbeat {

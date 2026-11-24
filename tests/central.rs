@@ -240,8 +240,11 @@ fn a_registration_the_service_refuses_is_retried_and_on_the_status() {
     pep.start().unwrap();
     assert!(!pep.status().registered);
     assert!(pep.status().last_error.contains("403"), "{}", pep.status().last_error);
+    std::thread::sleep(Duration::from_millis(3500));
+    let tries = stub.count("/xacml/pep/register");
+    assert!((2..=3).contains(&tries), "a refused registration backs off (2 s, then 4 s), not once a second: {tries} in 3.5 s");
     stub.script.lock().unwrap().register_status = 201;
-    assert!(stub.wait(Duration::from_secs(5), |_| pep.status().registered));
+    assert!(stub.wait(Duration::from_secs(6), |_| pep.status().registered));
 }
 
 #[test]
