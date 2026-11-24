@@ -8,12 +8,6 @@
 //! It knows nothing about OIDC, SAML, WS-Federation or GNAP: a library hands
 //! it a subject (a claims map), its `pep` configuration, and the verified
 //! `pep-policies-changed` events from its Shared Signals stream.
-//!
-//! Nothing is implemented yet; the design and the work are on
-//! rcbj/iya-sts#1206 and this repository's first issue.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn builds() {}
-}
+#[cfg(feature = "local")]
+pub mod engine;

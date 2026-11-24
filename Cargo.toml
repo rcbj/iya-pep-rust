@@ -12,9 +12,32 @@ keywords = ["xacml", "pep", "authzen", "authorization"]
 categories = ["authentication"]
 
 [dependencies]
+base64 = "0.22"
+native-tls = "0.2"
+p256 = { version = "0.14", features = ["ecdsa", "pem", "getrandom"] }
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+ureq = { version = "2.12", default-features = false, features = ["tls", "native-tls"] }
+url = "2"
+# The engine's, under `local`.
+regex = { version = "1", optional = true, default-features = false, features = ["std", "unicode"] }
+roxmltree = { version = "0.20", optional = true }
+tokio = { version = "1", features = ["rt", "time", "sync"], optional = true }
 
 [features]
 default = []
 # The local PDP: the XACML engine and the policy pull. Without it, only
 # `central` mode (AuthZEN at the service) is compiled.
-local = []
+local = ["dep:regex", "dep:roxmltree"]
+# The background work as a task on the caller's tokio runtime, as
+# oidc-caep-risc's `tokio` feature does. Without it, a thread.
+tokio = ["dep:tokio"]
+
+[dev-dependencies]
+tiny_http = "0.12"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[package.metadata.docs.rs]
+all-features = true
