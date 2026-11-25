@@ -336,3 +336,48 @@ fn local_is_the_default_mode() {
         assert!(err.message.contains("the default") && err.message.contains("\"mode\": \"central\""), "{}", err.message);
     }
 }
+
+/// A cached Permit does not outlive a failing service: a failed evaluation
+/// drops every cached Permit and none is served until the service answers
+/// again; a failed heartbeat does the same with no evaluation asked.
+#[test]
+fn a_failing_service_drops_the_cached_permits() {
+    let stub = Stub::start();
+    let mut c = config(&stub, "cache-outage");
+    c.permit_cache_ms = 30_000;
+    let pep = Pep::new(c).unwrap();
+    assert!(pep.decide(&alice(), &read_42()).is_permit());
+    assert!(pep.decide(&alice(), &read_42()).is_permit());
+    assert_eq!(stub.count("/access/v1/evaluation"), 1, "cached");
+
+    // The service fails on another question: the cached Permit goes too.
+    stub.script.lock().unwrap().evaluation_default = (503, json!({}));
+    let write = Access::new("write", "order", "42");
+    let down = pep.decide(&alice(), &write);
+    assert!(matches!(down, Decision::Unavailable { .. }), "{down:?}");
+    assert_eq!(down.http_status(), 403);
+    assert_eq!(pep.status().permit_cache_entries, 0, "every cached Permit dropped");
+    let again = pep.decide(&alice(), &read_42());
+    assert!(matches!(again, Decision::Unavailable { .. }), "not served from the cache: {again:?}");
+    assert_eq!(stub.count("/access/v1/evaluation"), 3, "the service was asked, not the cache");
+
+    // It answers again: Permits are cached again.
+    stub.script.lock().unwrap().evaluation_default = (200, json!({"decision": true}));
+    assert!(pep.decide(&alice(), &read_42()).is_permit());
+    assert!(pep.decide(&alice(), &read_42()).is_permit());
+    assert_eq!(stub.count("/access/v1/evaluation"), 4, "cached once the service answered");
+
+    // A failed heartbeat drops them with no evaluation asked. The heartbeat
+    // runs in the PEP's background loop, which start() begins.
+    stub.script.lock().unwrap().heartbeat_status = 503;
+    pep.start().unwrap();
+    let before = pep.status().heartbeat_failures;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pep.status().heartbeat_failures == before && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(pep.status().heartbeat_failures > before, "a heartbeat failed");
+    assert_eq!(pep.status().permit_cache_entries, 0, "the heartbeat's failure dropped them");
+    assert!(pep.decide(&alice(), &read_42()).is_permit());
+    assert_eq!(stub.count("/access/v1/evaluation"), 5, "asked again, not served from the cache");
+}

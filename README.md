@@ -25,15 +25,18 @@ let subject = Subject::user("alice", claims);
 match pep.decide(&subject, &Access::new("read", "order", "42")) {
     Decision::Permit { obligations, .. } => { /* discharge the obligations, then serve */ }
     Decision::Deny { why } => { /* 403 */ }
-    Decision::Unavailable { why } => { /* 503: fail closed */ }
+    Decision::Unavailable { why } => { /* 403: fail closed */ }
 }
+// Or let the PEP choose the status: 200 for a Permit, 403 for anything else.
+let status = pep.decide(&subject, &access).http_status();
 
 // From the host library's verified SET stream:
 pep.on_policy_event(&event_payload);
 ```
 
 - **The subject** is a claims map the host library builds from its own sign-in. Only the claims the realm's catalogue declares are sent, because the service refuses an evaluation that names any other.
-- **`decide` never fails.** No policy held yet, or a service that can't be reached, is `Unavailable`, never a Permit.
+- **`decide` never fails, and every failure is a 403.** No policy held yet, a service that can't be reached or answers badly, an engine fault, or a panic while deciding is `Unavailable`, never a Permit; `Decision::http_status()` is 403 for it as for a Deny (200 only for a Permit).
+- **A cached Permit does not outlive an outage.** In `central` mode with `permitCacheMs`, a failed evaluation or a failed heartbeat drops every cached Permit, and none is served until the service answers an evaluation again.
 - **Obligations:** a Permit carries only obligations of the types named in `supportedObligations`. Anything else turns the Permit into a Deny.
 
 ## The PEP's credential

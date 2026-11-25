@@ -76,6 +76,21 @@ impl Decision {
     pub fn is_permit(&self) -> bool {
         matches!(self, Decision::Permit { .. })
     }
+
+    /// The HTTP status a host answers with: 200 for a Permit and 403 for
+    /// everything else. A Deny and a decision that could not be made
+    /// (`Unavailable`) are both 403: an enforcement point that cannot say
+    /// yes says no, whatever went wrong, and never answers a failure with a
+    /// 5xx a client might retry into a different answer. Whether the user
+    /// was signed in at all (401) is the host's question, asked before the
+    /// PEP is.
+    pub fn http_status(&self) -> u16 {
+        if self.is_permit() {
+            200
+        } else {
+            403
+        }
+    }
 }
 
 /// The AuthZEN evaluation body both modes decide: `central` sends it, and
@@ -164,6 +179,13 @@ pub(crate) fn pull_subject_roots(credential: &crate::credential::Credential, bas
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_permit_is_200_and_everything_else_403() {
+        assert_eq!(Decision::Permit { obligations: vec![], advice: vec![] }.http_status(), 200);
+        assert_eq!(Decision::Deny { why: "no".into() }.http_status(), 403);
+        assert_eq!(Decision::Unavailable { why: "down".into() }.http_status(), 403);
+    }
 
     #[test]
     fn the_body_carries_the_bound_application_and_no_empty_properties() {

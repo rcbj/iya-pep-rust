@@ -205,6 +205,11 @@ pub(crate) struct Inner {
     wake: Mutex<Wake>,
     signal: Condvar,
     permits: Mutex<HashMap<String, (Instant, Decision)>>,
+    /// `central`: set when a call to the service fails (an evaluation that
+    /// could not be made or answered, or a failed heartbeat), cleared by the
+    /// next evaluation the service answers. While set, no cached Permit is
+    /// served: a Permit is not kept alive by an outage.
+    service_failing: AtomicBool,
     /// `central`: the catalogue's subject properties and its token. The
     /// service refuses an evaluation naming a property its catalogue does
     /// not declare, so only these of a subject's claims are sent.
@@ -225,6 +230,20 @@ pub(crate) struct Inner {
 pub struct Pep {
     inner: Arc<Inner>,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Runs one decision, turning a panic into `Unavailable` (and telling
+/// `note` why) rather than unwinding into the host.
+fn guarded(decide: impl FnOnce() -> Decision, note: impl FnOnce(&str)) -> Decision {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(decide)) {
+        Ok(decision) => decision,
+        Err(panic) => {
+            let what = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic".into());
+            let why = format!("the PEP failed while deciding: {what}");
+            note(&why);
+            Decision::Unavailable { why }
+        }
+    }
 }
 
 impl Pep {
@@ -250,6 +269,7 @@ impl Pep {
                 wake: Mutex::new(Wake::default()),
                 signal: Condvar::new(),
                 permits: Mutex::new(HashMap::new()),
+                service_failing: AtomicBool::new(false),
                 subject_roots: RwLock::new((String::new(), Arc::new(HashSet::new()))),
                 identity: RwLock::new(String::new()),
                 held: RwLock::new(None),
@@ -315,10 +335,19 @@ impl Pep {
     /// `Unavailable`.
     pub fn decide(&self, subject: &Subject, access: &Access) -> Decision {
         let began = Instant::now();
-        let decision = match self.inner.config.mode {
-            Mode::Central => self.inner.decide_central(subject, access),
-            Mode::Local => self.inner.decide_local(subject, access),
-        };
+        // A panic while deciding (a defect in the engine, a mapping, the
+        // HTTP client) is a decision that could not be made, never an
+        // unwound host thread with no answer: the host gets `Unavailable`,
+        // which it refuses like any other (`Decision::http_status()`).
+        // Every lock the PEP holds is read through `into_inner()`, so a
+        // poisoned one does not turn the next decision into a second panic.
+        let decision = guarded(
+            || match self.inner.config.mode {
+                Mode::Central => self.inner.decide_central(subject, access),
+                Mode::Local => self.inner.decide_local(subject, access),
+            },
+            |why| self.inner.note("decide", why),
+        );
         let c = &self.inner.counters;
         let micros = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
         c.decision_micros_total.fetch_add(micros, Ordering::Relaxed);
@@ -519,6 +548,16 @@ impl Inner {
 
     /// One heartbeat. Returns whether the service says the PEP is not
     /// current (a pull is due).
+    /// `central`: a call to the service failed, so every cached Permit is
+    /// dropped and none is served until the service answers an evaluation
+    /// again. (`local` holds no Permits: it decides from its policies.)
+    fn service_failed(&self) {
+        if self.config.mode == Mode::Central && self.config.permit_cache_ms > 0 {
+            self.service_failing.store(true, Ordering::Relaxed);
+            self.permits.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
     fn heartbeat(&self) -> bool {
         let url = format!("{}/xacml/pep/heartbeat", self.base());
         let c = &self.counters;
@@ -537,6 +576,9 @@ impl Inner {
         if matches!(&answer, Ok(a) if a.status == 200) {
             self.counters.heartbeats.fetch_add(1, Ordering::Relaxed);
             self.timing.lock().unwrap_or_else(|e| e.into_inner()).last_heartbeat = Some(Instant::now());
+        } else if !matches!(&answer, Ok(a) if a.status == 404) {
+            self.counters.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
+            self.service_failed();
         } else {
             self.counters.heartbeat_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -692,7 +734,7 @@ impl Inner {
         let body = evaluation_body(&declared_only(subject, &roots), access, &self.config.application, &self.config.supported_obligations);
         let cache_for = Duration::from_millis(self.config.permit_cache_ms);
         let cache_key = body.to_string();
-        if !cache_for.is_zero() {
+        if !cache_for.is_zero() && !self.service_failing.load(Ordering::Relaxed) {
             let mut permits = self.permits.lock().unwrap_or_else(|e| e.into_inner());
             match permits.get(&cache_key) {
                 Some((at, decision)) if at.elapsed() < cache_for => {
@@ -708,7 +750,10 @@ impl Inner {
         let url = format!("{}/access/v1/evaluation", self.base());
         let answer = match self.credential.call(Audience::Access, "POST", &url, "application/json", &[], Some(&Body::Json(&body))) {
             Ok(answer) => answer,
-            Err(err) => return Decision::Unavailable { why: format!("the service could not be asked: {err}") },
+            Err(err) => {
+                self.service_failed();
+                return Decision::Unavailable { why: format!("the service could not be asked: {err}") };
+            }
         };
         let json = answer.json().unwrap_or(Value::Null);
         let decision = match (answer.status, json.get("decision").and_then(Value::as_bool)) {
@@ -733,8 +778,15 @@ impl Inner {
                 .trim_end()
                 .to_string(),
             },
-            (status, _) => Decision::Unavailable { why: format!("the service answered {status} to the evaluation") },
+            (status, _) => {
+                self.service_failed();
+                Decision::Unavailable { why: format!("the service answered {status} to the evaluation") }
+            }
         };
+        if !matches!(decision, Decision::Unavailable { .. }) {
+            // The service answered: cached Permits may be served again.
+            self.service_failing.store(false, Ordering::Relaxed);
+        }
         if !cache_for.is_zero() && decision.is_permit() {
             self.permits.lock().unwrap_or_else(|e| e.into_inner()).insert(cache_key, (Instant::now(), decision.clone()));
         }
@@ -845,5 +897,21 @@ mod async_api {
             let pep = Arc::clone(self);
             let _ = blocking(move || pep.stop()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_while_deciding_is_unavailable_and_noted() {
+        let mut noted = String::new();
+        let d = guarded(|| panic!("engine bug"), |why| noted = why.to_string());
+        assert!(matches!(&d, Decision::Unavailable { why } if why.contains("engine bug")), "{d:?}");
+        assert!(noted.contains("engine bug"));
+        assert_eq!(d.http_status(), 403);
+        let ok = guarded(|| Decision::Deny { why: "policy".into() }, |_| panic!("not noted"));
+        assert_eq!(ok, Decision::Deny { why: "policy".into() });
     }
 }
