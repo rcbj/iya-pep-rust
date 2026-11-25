@@ -9,11 +9,37 @@
 //! it a subject (a claims map), its `pep` configuration, and the verified
 //! `pep-policies-changed` events from its Shared Signals stream.
 //!
-//! Nothing is implemented yet; the design and the work are on
-//! rcbj/iya-sts#1206 and this repository's first issue.
+//! ```no_run
+//! use iya_pep::{Access, Mode, Pep, PepConfig, Subject};
+//!
+//! let config = PepConfig::new("pep-orders", Mode::Central, "/etc/app/pep-key.pem",
+//!     "https://sts.example/realm/shop", "orders");
+//! let pep = Pep::new(config)?;
+//! pep.start()?;
+//! let subject = Subject::user("alice", serde_json::Map::new());
+//! if pep.decide(&subject, &Access::new("read", "order", "42")).is_permit() {
+//!     // serve it
+//! }
+//! # Ok::<(), iya_pep::PepError>(())
+//! ```
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn builds() {}
-}
+#[cfg(feature = "local")]
+pub mod authzen;
+pub mod config;
+pub mod credential;
+pub mod decision;
+#[cfg(feature = "local")]
+pub mod engine;
+pub mod error;
+pub mod http;
+pub mod key;
+#[cfg(feature = "local")]
+pub mod local;
+pub mod pep;
+pub mod records;
+
+pub use config::{Mode, PepConfig};
+pub use decision::{Access, Decision, Obligation, Subject};
+pub use error::PepError;
+pub use key::{jwk_thumbprint, pem_thumbprint};
+pub use pep::{EventStream, Pep, Status, POLICIES_CHANGED_EVENT, PROTOCOL_VERSION};
