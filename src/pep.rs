@@ -234,7 +234,10 @@ impl Pep {
         let client = Client::new(&config.tls_ca, Duration::from_millis(config.timeout_ms))?;
         let credential = Credential::new(&config, client)?;
         let instance = random_id();
-        let event_stream = if config.signals { EventStream::Requested } else { EventStream::None };
+        // DOWN until the host says its stream is running and asked for the
+        // event (`set_event_stream`): a PEP must not wait for an event
+        // nobody has shown it will hear, nor tell the service it hears one.
+        let event_stream = if config.signals { EventStream::Down } else { EventStream::None };
         Ok(Self {
             inner: Arc::new(Inner {
                 records: Records::new(instance),
@@ -439,6 +442,15 @@ impl Inner {
         self.config.base()
     }
 
+    /// How long to the next scheduled pull: the fallback poll while the
+    /// stream is running and carries `pep-policies-changed`, and the poll
+    /// interval otherwise (no stream, the event excluded, or the stream
+    /// down), so a PEP that cannot hear of a change still catches up soon.
+    fn poll_period(&self) -> Duration {
+        let state = *self.event_stream.lock().unwrap_or_else(|e| e.into_inner());
+        Duration::from_millis(if state == EventStream::Requested { self.config.fallback_poll_ms } else { self.config.poll_interval_ms })
+    }
+
     /// The caller fact `local` writes: the DN the registration answered,
     /// which is what the service writes for this PEP's evaluations, else the
     /// PEP's name.
@@ -607,8 +619,7 @@ impl Inner {
         let mut next_register = now;
         let mut register_retry = REGISTER_RETRY_FIRST;
         let register_retry_max = Duration::from_millis(self.config.heartbeat_interval_ms).max(REGISTER_RETRY_FIRST);
-        let poll = Duration::from_millis(if self.config.signals { self.config.fallback_poll_ms } else { self.config.poll_interval_ms });
-        let mut next_pull = now + poll;
+        let mut next_pull = now + self.poll_period();
         loop {
             let pull_asked = {
                 let mut wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
@@ -637,13 +648,19 @@ impl Inner {
                     register_retry = (register_retry * 2).min(register_retry_max);
                 }
             }
+            // The stream can go down (or come up) while a pull is scheduled:
+            // a wait meant for the fallback poll is cut to the poll interval.
+            let period = self.poll_period();
+            if next_pull > now + period {
+                next_pull = now + period;
+            }
             let mut pull_due = pull_asked || now >= next_pull;
             if now >= next_heartbeat {
                 next_heartbeat = now + Duration::from_millis(self.config.heartbeat_interval_ms);
                 pull_due |= self.heartbeat();
             }
             if pull_due {
-                next_pull = Instant::now() + poll;
+                next_pull = Instant::now() + self.poll_period();
                 self.pull();
             }
             if now >= next_records {

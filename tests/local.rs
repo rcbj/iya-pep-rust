@@ -167,6 +167,7 @@ fn the_event_makes_the_pep_pull_with_its_own_token() {
     let mut c = config(&stub, "l-event");
     c.signals = true;
     let pep = Pep::new(c).unwrap();
+    pep.set_event_stream(EventStream::Requested);
     pep.start().unwrap();
     assert!(pep.decide(&alice(None), &on("read")).is_permit());
     {
@@ -211,6 +212,7 @@ fn with_a_stream_it_waits_for_the_event_or_a_heartbeat_saying_it_is_stale() {
     c.signals = true;
     c.poll_interval_ms = 1000;
     let pep = Pep::new(c).unwrap();
+    pep.set_event_stream(EventStream::Requested);
     pep.start().unwrap();
     {
         let mut s = stub.script.lock().unwrap();
@@ -248,6 +250,7 @@ fn the_heartbeat_reports_what_is_held_and_the_stream() {
     let mut c = config(&stub, "l-beat");
     c.signals = true;
     let pep = Pep::new(c).unwrap();
+    pep.set_event_stream(EventStream::Requested);
     pep.start().unwrap();
     assert!(stub.wait(Duration::from_secs(5), |s| s.count("/xacml/pep/heartbeat") >= 1));
     let beat = stub.seen("/xacml/pep/heartbeat")[0].json();
@@ -267,6 +270,7 @@ fn the_status_reports_times_counters_and_what_is_held() {
     c.signals = true;
     c.fallback_poll_ms = 60_000;
     let pep = Pep::new(c).unwrap();
+    pep.set_event_stream(EventStream::Requested);
     let before = pep.status();
     assert_eq!((before.uptime, before.since_last_pull, before.until_next_pull), (None, None, None), "nothing has happened yet");
     pep.start().unwrap();
@@ -333,4 +337,32 @@ fn the_caller_fact_is_the_dn_the_registration_named() {
     }
     unregistered.pull_now().unwrap();
     assert!(unregistered.decide(&alice(None), &on("who")).is_permit());
+}
+
+#[test]
+fn a_stream_that_is_down_or_not_yet_reported_means_polling() {
+    let stub = stub();
+    let mut c = config(&stub, "l-down");
+    c.signals = true;
+    c.poll_interval_ms = 1000;
+    let pep = Pep::new(c).unwrap();
+    assert_eq!(pep.status().event_stream, EventStream::Down, "nothing reported yet: down, not requested");
+    pep.start().unwrap();
+    assert!(pep.decide(&alice(None), &on("read")).is_permit());
+    {
+        let mut s = stub.script.lock().unwrap();
+        s.policies = vec![orders_policy(false)];
+        s.policy_token = "p2".into();
+    }
+    assert!(stub.wait(Duration::from_secs(5), |_| !pep.decide(&alice(None), &on("read")).is_permit()), "down: it polls at the poll interval");
+    pep.set_event_stream(EventStream::Requested);
+    let next = pep.status().until_next_pull.unwrap_or_default();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(pep.status().until_next_pull.unwrap() > Duration::from_secs(10), "requested: the next pull is the fallback poll's ({next:?})");
+    pep.set_event_stream(EventStream::Down);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(pep.status().until_next_pull.unwrap() <= Duration::from_secs(1), "down again: the wait is cut to the poll interval");
+    let bodies = stub.seen("/xacml/pep/heartbeat");
+    assert!(bodies.iter().any(|b| b.json()["policyEvents"] == "down"), "the heartbeat says down");
+    pep.stop();
 }
