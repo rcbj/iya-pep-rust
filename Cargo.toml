@@ -13,21 +13,31 @@ categories = ["authentication"]
 
 [dependencies]
 base64 = "0.22"
-native-tls = "0.2"
+native-tls = { version = "0.2", optional = true }
 p256 = { version = "0.14", features = ["ecdsa", "pem", "getrandom"] }
 rand = "0.8"
 rsa = { version = "0.9", features = ["pem", "sha2"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
-ureq = { version = "2.12", default-features = false, features = ["tls", "native-tls"] }
+ureq = { version = "2.12", default-features = false }
 url = "2"
 # The engine's, under `local`.
 regex = { version = "1", optional = true, default-features = false, features = ["std", "unicode"] }
 roxmltree = { version = "0.20", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
+# The `rustls` TLS backend.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.9", optional = true, features = ["std"] }
+webpki-roots = { version = "1.0", optional = true }
 
 [features]
-default = []
+# One TLS backend. `native-tls` (OpenSSL on Linux) uses the platform's trust
+# store; `rustls` uses webpki's roots and links no OpenSSL, for a host that
+# already uses rustls. Either way `tlsCa` is added to those roots. With both
+# on, rustls is used.
+default = ["native-tls"]
+native-tls = ["dep:native-tls", "ureq/native-tls"]
+rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "ureq/tls"]
 # The local PDP: the XACML engine and the policy pull. Without it, only
 # `central` mode (AuthZEN at the service) is compiled.
 local = ["dep:regex", "dep:roxmltree"]

@@ -4,4 +4,12 @@
 FROM rust:1-bookworm AS test
 WORKDIR /src
 COPY . .
-RUN rustup component add clippy && cargo test --all-features && cargo test --no-default-features && cargo clippy --all-features --all-targets -- -D warnings && cargo clippy --no-default-features --all-targets -- -D warnings && cargo build --lib
+RUN rustup component add clippy \
+ && cargo test --all-features \
+ && cargo test \
+ && cargo test --no-default-features --features rustls,local \
+ && cargo clippy --all-features --all-targets -- -D warnings \
+ && cargo clippy --all-targets -- -D warnings \
+ && cargo clippy --no-default-features --features rustls --all-targets -- -D warnings \
+ && cargo build --lib \
+ && cargo tree --no-default-features --features rustls,local -e normal | (! grep -E "openssl|native-tls")

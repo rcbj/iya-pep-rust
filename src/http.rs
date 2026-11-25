@@ -5,6 +5,7 @@
 //! process proxy environment is ignored, as in the authentication libraries.
 
 use std::io::Read;
+#[allow(unused_imports)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,29 +51,11 @@ pub struct Client {
 }
 
 impl Client {
-    /// `ca` is PEM trust anchors added to the system's, or empty.
+    /// `ca` is PEM trust anchors added to the backend's roots (the
+    /// platform's under `native-tls`, webpki's under `rustls`), or empty.
     pub fn new(ca: &str, timeout: Duration) -> Result<Self, PepError> {
-        let mut builder = ureq::AgentBuilder::new().timeout(timeout).redirects(0).try_proxy_from_env(false).user_agent(USER_AGENT);
-        if !ca.trim().is_empty() {
-            let mut tls = native_tls::TlsConnector::builder();
-            let mut found = false;
-            for block in ca.split("-----END CERTIFICATE-----") {
-                let trimmed = block.trim();
-                if !trimmed.contains("BEGIN CERTIFICATE") {
-                    continue;
-                }
-                let one = format!("{trimmed}\n-----END CERTIFICATE-----\n");
-                let cert = native_tls::Certificate::from_pem(one.as_bytes()).map_err(|_| PepError::new("config", "tlsCa is not a PEM trust anchor"))?;
-                tls.add_root_certificate(cert);
-                found = true;
-            }
-            if !found {
-                return Err(PepError::new("config", "tlsCa holds no PEM certificate"));
-            }
-            let connector = tls.build().map_err(|err| PepError::new("config", format!("tlsCa: {err}")))?;
-            builder = builder.tls_connector(Arc::new(connector));
-        }
-        Ok(Self { agent: builder.build() })
+        let builder = ureq::AgentBuilder::new().timeout(timeout).redirects(0).try_proxy_from_env(false).user_agent(USER_AGENT);
+        Ok(Self { agent: tls(builder, ca)?.build() })
     }
 
     /// Sends one request. Any status is an `Answer`; only a transport
@@ -121,4 +104,60 @@ impl Client {
 pub fn htu(url: &str) -> &str {
     let end = url.find(['?', '#']).unwrap_or(url.len());
     &url[..end]
+}
+
+#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+compile_error!("iya-pep needs a TLS backend: the `native-tls` feature (the default) or `rustls`");
+
+/// Each PEM certificate in `ca`, as its own PEM block.
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+fn pem_blocks(ca: &str) -> Vec<String> {
+    ca.split("-----END CERTIFICATE-----")
+        .map(str::trim)
+        .filter(|block| block.contains("BEGIN CERTIFICATE"))
+        .map(|block| format!("{block}\n-----END CERTIFICATE-----\n"))
+        .collect()
+}
+
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+fn tls(builder: ureq::AgentBuilder, ca: &str) -> Result<ureq::AgentBuilder, PepError> {
+    let mut tls = native_tls::TlsConnector::builder();
+    if !ca.trim().is_empty() {
+        let blocks = pem_blocks(ca);
+        if blocks.is_empty() {
+            return Err(PepError::new("config", "tlsCa holds no PEM certificate"));
+        }
+        for one in blocks {
+            let cert = native_tls::Certificate::from_pem(one.as_bytes()).map_err(|_| PepError::new("config", "tlsCa is not a PEM trust anchor"))?;
+            tls.add_root_certificate(cert);
+        }
+    }
+    let connector = tls.build().map_err(|err| PepError::new("config", format!("tlsCa: {err}")))?;
+    Ok(builder.tls_connector(Arc::new(connector)))
+}
+
+#[cfg(feature = "rustls")]
+fn tls(builder: ureq::AgentBuilder, ca: &str) -> Result<ureq::AgentBuilder, PepError> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::CertificateDer;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if !ca.trim().is_empty() {
+        let mut found = false;
+        for cert in CertificateDer::pem_slice_iter(ca.as_bytes()) {
+            let cert = cert.map_err(|_| PepError::new("config", "tlsCa is not a PEM trust anchor"))?;
+            roots.add(cert).map_err(|err| PepError::new("config", format!("tlsCa: {err}")))?;
+            found = true;
+        }
+        if !found {
+            return Err(PepError::new("config", "tlsCa holds no PEM certificate"));
+        }
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| PepError::new("config", format!("TLS: {err}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(builder.tls_config(Arc::new(config)))
 }
