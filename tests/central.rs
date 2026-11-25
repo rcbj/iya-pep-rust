@@ -272,7 +272,7 @@ fn a_changed_key_file_drops_the_tokens_and_a_bad_one_is_refused_at_start() {
 
     let bad = std::env::temp_dir().join(format!("iya-pep-bad-{}.pem", std::process::id()));
     std::fs::write(&bad, "not a key").unwrap();
-    let err = Pep::new(config_with_key(&stub, &bad.to_string_lossy())).err().expect("refused");
+    let Err(err) = Pep::new(config_with_key(&stub, &bad.to_string_lossy())) else { panic!("refused") };
     assert_eq!(err.code, "config");
 }
 
@@ -319,5 +319,20 @@ fn advice_in_the_answers_context_is_handed_as_local_hands_it() {
             assert_eq!(advice[0].properties["urn:example:count"], "3");
         }
         other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn local_is_the_default_mode() {
+    let stub = Stub::start();
+    let section: Value = json!({"name": NAME, "assertionKey": key_file("json-default")});
+    let read = PepConfig::from_json(&section, &stub.base, APP);
+    if cfg!(feature = "local") {
+        let c = read.unwrap();
+        assert_eq!(c.mode, iya_pep::Mode::Local, "no mode: local");
+        assert!(Pep::new(c).is_ok(), "a build with the engine runs it");
+    } else {
+        let err = read.expect_err("refused without the engine");
+        assert!(err.message.contains("the default") && err.message.contains("\"mode\": \"central\""), "{}", err.message);
     }
 }

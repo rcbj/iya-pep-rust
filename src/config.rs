@@ -129,7 +129,11 @@ impl PepConfig {
                 Some(v) => v.as_bool().ok_or_else(|| PepError::new("config", format!("pep.{key} must be true or false"))),
             }
         };
-        let mode = match text("mode", "central")?.as_str() {
+        // `local` by default: the PEP pulls its application's policies and
+        // decides in process, so a decision needs no round trip to the
+        // service. `central` (AuthZEN at the service for every decision) is
+        // asked for by name.
+        let mode = match text("mode", "local")?.as_str() {
             "central" => Mode::Central,
             "local" => Mode::Local,
             other => return Err(PepError::new("config", format!("pep.mode is \"{other}\"; it must be central or local"))),
@@ -183,7 +187,7 @@ impl PepConfig {
             return bad("pep.application must name the application the PEP is bound to".into());
         }
         if self.mode == Mode::Local && !cfg!(feature = "local") {
-            return bad("pep.mode is local, and this build has no engine (the iya-pep `local` feature)".into());
+            return bad("pep.mode is local (the default when mode is not set), and this build has no engine: build with the iya-pep `local` feature, or set \"mode\": \"central\"".into());
         }
         for (key, value, min) in [
             ("pollIntervalMs", self.poll_interval_ms, 1000),
@@ -227,8 +231,15 @@ mod tests {
 
     #[test]
     fn a_section_reads_with_defaults_and_refuses_unknown_members() {
-        let c = PepConfig::from_json(&json!({"name": "pep-1", "assertionKey": "/k.pem"}), "https://sts.example/realm/r1/", "app").unwrap();
-        assert_eq!(c.mode, Mode::Central);
+        let defaulted = PepConfig::from_json(&json!({"name": "pep-1", "assertionKey": "/k.pem"}), "https://sts.example/realm/r1/", "app");
+        if cfg!(feature = "local") {
+            assert_eq!(defaulted.unwrap().mode, Mode::Local, "local is the default");
+        } else {
+            let err = defaulted.unwrap_err();
+            assert!(err.message.contains("the default") && err.message.contains("central"), "no engine, no mode: refused, saying how to choose: {err}");
+        }
+        // The other defaults, read from a section any build can run.
+        let c = PepConfig::from_json(&json!({"name": "pep-1", "assertionKey": "/k.pem", "mode": "central"}), "https://sts.example/realm/r1/", "app").unwrap();
         assert_eq!(c.client_id, DEFAULT_CLIENT_ID);
         assert_eq!(c.base(), "https://sts.example/realm/r1");
         assert_eq!(c.realm(), "r1");
@@ -240,7 +251,7 @@ mod tests {
     #[test]
     fn bad_values_are_refused() {
         let base = |extra: Value| {
-            let mut v = json!({"name": "pep-1", "assertionKey": "/k.pem"});
+            let mut v = json!({"name": "pep-1", "assertionKey": "/k.pem", "mode": "central"});
             for (k, x) in extra.as_object().unwrap() {
                 v[k] = x.clone();
             }
@@ -252,6 +263,6 @@ mod tests {
         assert!(base(json!({"pollIntervalMs": 10})).is_err());
         assert!(base(json!({"permitCacheMs": 120000})).is_err());
         assert!(base(json!({"application": ""})).is_err());
-        assert_eq!(PepConfig::from_json(&json!({"name": "p", "assertionKey": "k"}), "https://sts.example", "a").unwrap().realm(), "");
+        assert_eq!(PepConfig::from_json(&json!({"name": "p", "assertionKey": "k", "mode": "central"}), "https://sts.example", "a").unwrap().realm(), "");
     }
 }

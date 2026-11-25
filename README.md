@@ -51,7 +51,7 @@ The key is certified, and the PEP bound to its application, with iya-sts's `issu
 | Member | Default | |
 |---|---|---|
 | `name` | (required) | The PEP's service account. |
-| `mode` | `central` | `central` or `local`. |
+| `mode` | `local` | `local` (pull the bound application's policies and decide in process; needs the `local` feature) or `central` (ask the service for every decision). A build without the `local` feature that leaves `mode` out is refused with a message saying so. |
 | `assertionKey` | (required) | The path of the PEP's private key, in PEM. |
 | `clientId` | `sts-remote-pep` | |
 | `pdpUrl` | the library's issuer | The service, with `/realm/<id>`. |
