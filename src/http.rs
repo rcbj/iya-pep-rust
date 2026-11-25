@@ -116,7 +116,15 @@ fn pem_blocks(ca: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|block| block.contains("BEGIN CERTIFICATE"))
         .map(|block| format!("{block}\n-----END CERTIFICATE-----\n"))
-        .collect()
+        .fold(Vec::new(), |mut seen: Vec<String>, block| {
+            // OpenSSL refuses an anchor it already holds, so a file that
+            // repeats a certificate (easily done when chains are joined)
+            // would stop the connector being built. Each is added once.
+            if !seen.contains(&block) {
+                seen.push(block);
+            }
+            seen
+        })
 }
 
 #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
